@@ -1,0 +1,20 @@
+{
+    "q_theta": 5.0,
+    "q_alpha": 300.0,
+    "q_theta_dot": 1.0,
+    "q_alpha_dot": 20.0,
+    "r": 1.0,
+    "k_theta": -2.203759,
+    "k_alpha": 228.177643,
+    "k_theta_dot": -3.061594,
+    "k_alpha_dot": 38.173909,
+    "theta_target_deg": 13.0,
+    "observer_p1": -80.0,
+    "observer_p2": -70.0,
+    "accel_max_rad_s2": 30.0,
+    "created_at": "2026-06-21T10:33:26",
+    "csv_file": "coleta_lqr_20260621_103326.csv",
+    "target_samples": 30000,
+    "flush_every": 200,
+    "note": "O CSV salva toda telemetria recebida pela serial. A taxa real depende do firmware. Para identificação em Ts=0.002 s, o firmware precisa enviar uma linha T a cada 2 ms."
+}

@@ -1,0 +1,16 @@
+{
+  "pendulo": {
+    "kp": 8.0,
+    "ki": 150.0,
+    "kd": 99999.0
+  },
+  "fuzzy_braco": {
+    "inicio_acao_deg": 180.0,
+    "acao_maxima_deg": 180.0,
+    "offset_max_setpoint_deg": 0.0,
+    "limiar_vel_alta_deg_s": 0.0
+  },
+  "motor": {
+    "step_cmd_slew": 30
+  }
+}
