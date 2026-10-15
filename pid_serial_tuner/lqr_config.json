@@ -1,0 +1,11 @@
+{
+  "lqr": {
+    "k_theta": -2.2038,
+    "k_alpha": 228.1777,
+    "k_theta_dot": -3.0616,
+    "k_alpha_dot": 38.1739
+  },
+  "limits": {
+    "accel_max_rad_s2": 200.0
+  }
+}
