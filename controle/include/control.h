@@ -9,3 +9,7 @@ void control_set_theta_target_rad(float theta_target_rad);
 float control_get_theta_target_rad();
 float control_get_theta_ref_rad();
 void control_reset_theta_reference();
+
+// Velocidade da rampa de theta_ref em rad/s; 0 = degrau instantaneo.
+void control_set_theta_ref_rate_rad_s(float rate_rad_s);
+float control_get_theta_ref_rate_rad_s();

@@ -1,15 +1,16 @@
 {
   "lqr": {
-    "k_theta": -48.203612,
-    "k_alpha": 988.361399,
-    "k_theta_dot": -39.773833,
-    "k_alpha_dot": 164.528939
+    "k_theta": -34.311304,
+    "k_alpha": 763.316351,
+    "k_theta_dot": -28.879132,
+    "k_alpha_dot": 127.087297
   },
   "limits": {
     "accel_max_rad_s2": 30.0
   },
   "theta_ref": {
-    "theta_target_deg": 0.0
+    "theta_target_deg": -90.0,
+    "rate_rad_s": 999999999.0
   },
   "observer": {
     "lr00": 13.8058166,
@@ -33,14 +34,59 @@
     "q_alpha": 3000.0,
     "q_theta_dot": 500.0,
     "q_alpha_dot": 20.0,
-    "r": 1.0
+    "r": 2.0
   },
   "observer_poles": {
     "p1": -14.0,
     "p2": -5.0
   },
   "microsteps": {
-    "auto_enabled": true,
-    "manual": 256
+    "auto_enabled": false,
+    "manual": 256,
+    "ramp_down": {
+      "enabled": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "ms": [
+        100,
+        100,
+        100,
+        100
+      ]
+    },
+    "ramp_up": {
+      "enabled": [
+        true,
+        false,
+        true,
+        true
+      ],
+      "ms": [
+        200,
+        1000,
+        1000,
+        1000
+      ]
+    }
+  },
+  "disturbance": {
+    "magnitude_rad_s2": 175.0,
+    "duration_ms": 500,
+    "negative": true,
+    "kick_alpha_deg": 5.0,
+    "kick_accel_rad_s2": 60.0
+  },
+  "ui": {
+    "sections": {
+      "serial": true,
+      "lqr": false,
+      "theta_ref": false,
+      "microsteps": false,
+      "dist": true,
+      "observer": false
+    }
   }
 }

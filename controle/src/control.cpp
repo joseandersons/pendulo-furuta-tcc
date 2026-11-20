@@ -15,6 +15,8 @@
 #include "driver_tmc.h"
 #include "microstep_control.h"
 #include "autozero.h"
+#include "disturbance.h"
+#include <esp_timer.h>
 
 #ifndef ALPHA_DISABLE_RAD
 #define ALPHA_DISABLE_RAD 0.34906585040f   // 20 graus
@@ -39,6 +41,7 @@ static volatile bool g_start_requested = false;
 */
 static volatile float g_theta_target_rad = 0.0f;
 static volatile float g_theta_ref_rad = 0.0f;
+static volatile float g_theta_ref_rate_rad_s = THETA_REF_RATE_LIMIT_RAD_S;
 
 static portMUX_TYPE g_theta_reference_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -106,6 +109,24 @@ float control_get_theta_ref_rad() {
   return ref_rad;
 }
 
+void control_set_theta_ref_rate_rad_s(float rate_rad_s) {
+  if (!isfinite(rate_rad_s) || rate_rad_s < 0.0f) {
+    rate_rad_s = 0.0f;
+  }
+
+  portENTER_CRITICAL(&g_theta_reference_mux);
+  g_theta_ref_rate_rad_s = rate_rad_s;
+  portEXIT_CRITICAL(&g_theta_reference_mux);
+}
+
+float control_get_theta_ref_rate_rad_s() {
+  portENTER_CRITICAL(&g_theta_reference_mux);
+  const float rate = g_theta_ref_rate_rad_s;
+  portEXIT_CRITICAL(&g_theta_reference_mux);
+
+  return rate;
+}
+
 void control_reset_theta_reference() {
   portENTER_CRITICAL(&g_theta_reference_mux);
   g_theta_target_rad = 0.0f;
@@ -117,6 +138,7 @@ static float theta_reference_update(float dt) {
   portENTER_CRITICAL(&g_theta_reference_mux);
   const float target_rad = g_theta_target_rad;
   float ref_rad = g_theta_ref_rad;
+  const float rate_rad_s = g_theta_ref_rate_rad_s;
   portEXIT_CRITICAL(&g_theta_reference_mux);
 
   const float error_rad = shortest_angular_difference(
@@ -124,13 +146,10 @@ static float theta_reference_update(float dt) {
     ref_rad
   );
 
-  const float max_step_rad = THETA_REF_RATE_LIMIT_RAD_S * dt;
-
-  const float step_rad = clampf_local(
-    error_rad,
-    -max_step_rad,
-    max_step_rad
-  );
+  // rate = 0: degrau instantaneo (theta_ref vai direto ao alvo).
+  const float step_rad = (rate_rad_s <= 0.0f)
+    ? error_rad
+    : clampf_local(error_rad, -rate_rad_s * dt, rate_rad_s * dt);
 
   ref_rad = wrapPi(ref_rad + step_rad);
 
@@ -200,6 +219,7 @@ static float alpha_velocity_update(float alpha_rad, uint32_t stamp_us) {
 }
 
 static void reset_state_on_start() {
+  disturbance_reset(esp_timer_get_time(), "START_RESET");
   prev_us = 0;
   g_last_processed_sample_id = 0;
 
@@ -223,6 +243,7 @@ static void reset_state_on_start() {
 }
 
 void control_request_start() {
+  disturbance_reset(esp_timer_get_time(), "START_RESET");
   tmc_init();
   microstep_control_apply_startup(0.0f);
   g_start_requested = true;
@@ -230,6 +251,7 @@ void control_request_start() {
 }
 
 void control_stop() {
+  disturbance_reset(esp_timer_get_time(), "STOP");
   g_control_enabled = false;
   g_start_requested = false;
   g_mode = CONTROL_MODE_STOPPED;
@@ -261,7 +283,9 @@ static void send_telemetry(
   float theta_dot_rad_s,
   float u_rad_s2,
   float vel_cmd_rad_s,
-  bool enabled
+  bool enabled,
+  const DistSnapshot& dist = DistSnapshot{},
+  int64_t control_us = 0
 ) {
   static uint32_t last_tx = 0;
 
@@ -288,11 +312,24 @@ static void send_telemetry(
   pkt.u_c2 = (int16_t)lroundf(u_rad_s2 * 100.0f);
   pkt.vel_c2 = (int16_t)lroundf(vel_cmd_rad_s * 100.0f);
   pkt.enabled = enabled ? 1 : 0;
+  pkt.control_us = control_us ? control_us : esp_timer_get_time();
+  pkt.d_c2 = (int32_t)lroundf(dist.value * 100.0f);
+  pkt.total_c2 = (int32_t)lroundf((u_rad_s2 + dist.value) * 100.0f);
+  pkt.microsteps = motor_get_microsteps_runtime();
+  pkt.mode = (uint8_t)g_mode;
+  pkt.ms_auto = microstep_control_get_auto_enabled();
+  pkt.gain_profile = lqr_is_disturbance_profile();
+  pkt.pulse_id = dist.id;
+  pkt.pulse_a_c2 = (int32_t)lroundf(dist.amplitude * 100.0f);
+  pkt.pulse_ms = dist.duration_ms;
+  pkt.theta_ref_c2 = (int16_t)lroundf(rad2deg(wrapPi(control_get_theta_ref_rad())) * 100.0f);
+  pkt.ref_rate_c2 = (uint32_t)lroundf(fminf(control_get_theta_ref_rate_rad_s() * 100.0f, 4.0e9f));
 
   xQueueSend(qTel, &pkt, 0);
 }
 
 static void control_step(const Obs& o) {
+  const uint32_t dist_generation = disturbance_generation();
   float dt = compute_dt(o.stamp_us);
 
   // Zero com parte fracionaria (calibracao no topo), em contagens
@@ -332,6 +369,7 @@ static void control_step(const Obs& o) {
   state.alpha_dot = alpha_dot_rad_s;
 
   if (g_mode == CONTROL_MODE_SWING_UP) {
+    disturbance_update(esp_timer_get_time(), false, state.alpha, dist_generation);
     SwingUpOutput sw = swing_up_update(state, dt); //VERIFICAE
 
     motor_set_velocity_adaptive_rad_s(
@@ -379,6 +417,7 @@ static void control_step(const Obs& o) {
   if (g_mode == CONTROL_MODE_LQR) {
     
     if (fabsf(state.alpha) > ALPHA_DISABLE_RAD) {
+      disturbance_reset(esp_timer_get_time(), "MODE");
       lqr_reset();
       swing_up_reset();
       observer_reset();
@@ -431,14 +470,25 @@ static void control_step(const Obs& o) {
     state_lqr.theta = sinf(state_est.theta - theta_ref_rad);
 
     LQROutput lqr = lqr_update(state_lqr, dt);
-
-    motor_set_acceleration_adaptive_rad_s2(
-      lqr.accel_cmd_rad_s2,
-      state_est.alpha,
-      state_est.alpha_dot
-    );
-
-    g_last_lqr_accel_rad_s2 = lqr.accel_cmd_rad_s2;
+    const int64_t command_us = esp_timer_get_time();
+    const DistSnapshot dist = disturbance_update(command_us,
+      g_control_enabled && !g_start_requested && g_mode == CONTROL_MODE_LQR &&
+      isfinite(state_est.alpha) && fabsf(state_est.alpha) <= ALPHA_ENABLE_RAD,
+      state.alpha, dist_generation, state.alpha_dot);
+    const float u_lqr = lqr.accel_cmd_rad_s2;
+    // KICK: LQR suspenso, o braco segue so o tranco programado.
+    const bool kick_active = dist.kick && dist.state == DistState::ACTIVE;
+    const float u_test = kick_active ? dist.value : u_lqr + dist.value;
+    if (dist.state == DistState::ACTIVE) {
+      motor_set_pulse_acceleration_rad_s2(u_test, u_lqr, dist.id,
+                                        state_est.alpha, state_est.alpha_dot,
+                                        kick_active);
+    } else {
+      motor_set_acceleration_adaptive_rad_s2(u_lqr, state_est.alpha, state_est.alpha_dot);
+    }
+    // Preserve the observer's existing requested-input convention, now including d.
+    // This is NOT measured acceleration; jerk/velocity/step limits are downstream.
+    g_last_lqr_accel_rad_s2 = u_test;
 
     {
       const float target_rad = control_get_theta_target_rad();
@@ -466,7 +516,9 @@ static void control_step(const Obs& o) {
       state_est.theta_dot,
       lqr.accel_cmd_rad_s2,
       motor_get_velocity_cmd_rad_s(),
-      true
+      true,
+      dist,
+      command_us
     );
 
     return;

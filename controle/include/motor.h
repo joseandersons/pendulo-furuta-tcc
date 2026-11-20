@@ -14,6 +14,11 @@ void motor_set_velocity_adaptive_rad_s(
 );
 
 void motor_set_acceleration_rad_s2(float accel_rad_s2);
+
+// no_jerk = true (toque KICK): o degrau de aceleracao nao passa pelo limite de
+// jerk, para o tranco +a/-a sair como programado e o braco terminar parado.
+void motor_set_pulse_acceleration_rad_s2(float total, float nominal, uint32_t pulse_id,
+                                       float alpha, float alpha_dot, bool no_jerk = false);
 void motor_set_acceleration_adaptive_rad_s2(
   float accel_rad_s2,
   float alpha_rad,

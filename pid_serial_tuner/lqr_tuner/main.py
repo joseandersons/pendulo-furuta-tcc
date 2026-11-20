@@ -3,19 +3,24 @@ import time
 import math
 import threading
 import collections
+import json
+import queue
 from datetime import datetime
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QGroupBox,
     QFormLayout, QDoubleSpinBox, QPushButton, QLabel, QTextEdit,
     QComboBox, QMessageBox, QScrollArea, QGridLayout, QSizePolicy,
-    QLineEdit
+    QLineEdit, QSlider, QSpinBox, QCheckBox
 )
 from PySide6.QtCore import QTimer, Qt, QObject, Signal, QThread, Slot
 import pyqtgraph as pg
 
-from config_store import DATA_DIR, load_config, save_config
+from config_store import DATA_DIR, load_config, save_config, save_ui_sections
 from telemetry import decode_telemetry
+from disturbance import (AMPLITUDE_MAX, DURATION_MAX_MS, DURATION_MIN_MS,
+                         KICK_ACCEL_MIN, KICK_ALPHA_MAX_DEG, KICK_ALPHA_MIN_DEG,
+                         decode_disturbance, kick_command, pulse_command)
 from serial_comm import (
     serial_is_open, list_serial_ports, open_serial, close_serial,
     drain, send_line, read_until_prefix, read_line
@@ -26,6 +31,11 @@ from observer_matrix import observer_matrices_from_poles
 WIN_SEC = 20.0
 HZ = 50
 GUI_HZ = 20
+EXPERIMENT_COLUMNS = [
+    "firmware_t_us", "d_rad_s2", "u_total_requested_rad_s2", "microsteps_active",
+    "controller_mode", "microstep_auto_actual", "gain_profile", "pulse_id",
+    "pulse_amplitude_rad_s2", "pulse_duration_ms", "theta_ref_deg", "theta_ref_rate_rad_s",
+]
 
 # Calibracao do zero do pendulo no topo
 TOP_CALIB_SEC = 5.0          # tempo de media com o pendulo equilibrado
@@ -45,29 +55,82 @@ FUZZY_ALPHA_DOT_HIGH_START_DEG_S = 80.0
 FUZZY_ALPHA_DOT_HIGH_FULL_DEG_S = 110.0
 FUZZY_ALPHA_DOT_MAX_DEG_S = 150.0
 
+# Rampa de micropassos do modo automatico (mesma ordem do firmware: MSRD/MSRU).
+# O 256 e sempre o inicio da descida e o fim da subida.
+MICROSTEP_RAMP_LEVELS = [128, 64, 32, 16]
+MICROSTEP_RAMP_MAX_MS = 100000
+MICROSTEP_RAMP_DOWN_DEFAULT_MS = 0
+MICROSTEP_RAMP_UP_DEFAULT_MS = 200
+
 
 def hud_text(lines):
     return "\n".join(lines)
+
+
+class CollapsibleSection(QWidget):
+    """Seção da barra lateral que abre/fecha ao clicar no título."""
+
+    toggled = Signal(str, bool)
+
+    def __init__(self, key, title, widgets, expanded=False):
+        super().__init__()
+        self.key = key
+        self.title = title
+
+        self.btn = QPushButton()
+        self.btn.setCheckable(True)
+        self.btn.setChecked(expanded)
+        self.btn.setStyleSheet("text-align: left; font-weight: bold; padding: 6px 8px;")
+
+        self.body = QWidget()
+        body_layout = QVBoxLayout(self.body)
+        body_layout.setContentsMargins(10, 0, 0, 4)
+        body_layout.setSpacing(6)
+
+        for w in widgets:
+            body_layout.addWidget(w)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self.btn)
+        layout.addWidget(self.body)
+
+        self.btn.toggled.connect(self._on_toggled)
+        self._on_toggled(expanded, notify=False)
+
+    def set_expanded(self, expanded):
+        self.btn.setChecked(bool(expanded))
+
+    def is_expanded(self):
+        return self.btn.isChecked()
+
+    def _on_toggled(self, checked, notify=True):
+        self.btn.setText(f"{'▾' if checked else '▸'}  {self.title}")
+        self.body.setVisible(checked)
+
+        if notify:
+            self.toggled.emit(self.key, checked)
 
 class SerialCommandWorker(QObject):
     log = Signal(str)
     finished = Signal(bool, str)
 
-    def __init__(self, commands, serial_lock):
+    def __init__(self, commands, serial_lock, on_line=None):
         super().__init__()
         self.commands = commands
         self.serial_lock = serial_lock
+        self.on_line = on_line
 
     def run(self):
         try:
             with self.serial_lock:
-                drain()
-
                 for cmd, prefix in self.commands:
                     self.log.emit(f"[ENVIO] {cmd}")
                     send_line(cmd)
-
-                    resp = read_until_prefix(prefix)
+                    if prefix is None:
+                        continue  # DIST lifecycle is consumed by the normal reader.
+                    resp = read_until_prefix(prefix, on_line=self.on_line)
 
                     if resp:
                         self.log.emit(f"[RESP] {resp}")
@@ -91,11 +154,19 @@ class LQRTunerWindow(QWidget):
         self.buf_t = collections.deque(maxlen=int(WIN_SEC * HZ))
         self.buf = {
             k: collections.deque(maxlen=int(WIN_SEC * HZ))
-            for k in ["A", "TH", "AD", "TD", "U", "VEL", "EN"]
+            for k in ["A", "TH", "AD", "TD", "U", "VEL", "EN", "D", "TR"]
         }
 
         self.log_buf = collections.deque(maxlen=500)
         self.stop_reader = False
+        self.rx_lines = queue.SimpleQueue()
+        self.dist_regions = {}
+        self.dist_pending_at = None
+        self._last_sample_t = None
+        self._time_rejects = 0
+        self._last_flush = 0.0
+        self.collect_events = []
+        self.collect_json_path = None
 
         self.serial_lock = threading.RLock()
         self.serial_command_active = threading.Event()
@@ -349,7 +420,17 @@ class LQRTunerWindow(QWidget):
             lay.addWidget(spn, stretch=1)
             grid.addWidget(box, row, col)
 
-        grp_serial = QGroupBox("Conexão serial")
+        # Seções recolhíveis: clicar no título abre/fecha. O estado fica salvo
+        # em config.json (ui.sections) e volta igual na próxima vez.
+        self.sections = {}
+
+        def add_section(key, title, widgets, expanded=False):
+            section = CollapsibleSection(key, title, widgets, expanded)
+            section.toggled.connect(self._on_section_toggled)
+            self.sections[key] = section
+            side.addWidget(section)
+
+        grp_serial = QGroupBox()
         serial_layout = QGridLayout(grp_serial)
         serial_layout.setHorizontalSpacing(8)
         serial_layout.setVerticalSpacing(6)
@@ -372,7 +453,7 @@ class LQRTunerWindow(QWidget):
         serial_layout.addWidget(QLabel("Status"), 2, 0)
         serial_layout.addWidget(self.lbl_serial_status, 2, 1, 1, 2)
 
-        side.addWidget(grp_serial)
+        add_section("serial", "Conexão serial", [grp_serial], expanded=True)
 
         btn_row1 = QHBoxLayout()
         self.btn_start = QPushButton("INICIAR")
@@ -396,7 +477,7 @@ class LQRTunerWindow(QWidget):
 
         side.addLayout(btn_row1)
 
-        grp_qr = QGroupBox("Sintonia LQR: Q e R")
+        grp_qr = QGroupBox("Sintonia: Q e R")
         grid_qr = QGridLayout(grp_qr)
         grid_qr.setHorizontalSpacing(10)
         grid_qr.setVerticalSpacing(6)
@@ -415,9 +496,7 @@ class LQRTunerWindow(QWidget):
         add_grid_spin(grid_qr, 2, 0, "R", self.spn_r)
         grid_qr.addWidget(self.btn_apply_lqr, 2, 1)
 
-        side.addWidget(grp_qr)
-
-        grp_lqr = QGroupBox("Ganhos LQR calculados")
+        grp_lqr = QGroupBox("Ganhos calculados")
         grid_lqr = QGridLayout(grp_lqr)
         grid_lqr.setHorizontalSpacing(10)
         grid_lqr.setVerticalSpacing(6)
@@ -432,23 +511,27 @@ class LQRTunerWindow(QWidget):
         add_grid_spin(grid_lqr, 1, 0, "k_theta_dot", self.spn_k_theta_dot)
         add_grid_spin(grid_lqr, 1, 1, "k_alpha_dot", self.spn_k_alpha_dot)
 
-        side.addWidget(grp_lqr)
+        add_section("lqr", "LQR: sintonia e ganhos", [grp_qr, grp_lqr])
 
-        grp_theta_ref = QGroupBox("Referência do braço θ")
+        grp_theta_ref = QGroupBox()
         grid_theta_ref = QGridLayout(grp_theta_ref)
         grid_theta_ref.setHorizontalSpacing(10)
         grid_theta_ref.setVerticalSpacing(6)
 
         self.spn_theta_target_deg = setup_spin(QDoubleSpinBox(), -180.0, 180.0, 3, 5.0)
         self.spn_theta_target_deg.setValue(0.0)
+        self.spn_theta_ref_rate = setup_spin(QDoubleSpinBox(), 0.0, 1.0e9, 2, 0.5)  # sem limite pratico
+        self.spn_theta_ref_rate.setValue(0.6)
+        self.spn_theta_ref_rate.setToolTip("Velocidade da rampa de θ ref em rad/s. 0 = degrau instantâneo.")
         self.btn_apply_theta_ref = QPushButton("Aplicar θ ref")
 
         add_grid_spin(grid_theta_ref, 0, 0, "θ alvo (graus)", self.spn_theta_target_deg)
-        grid_theta_ref.addWidget(self.btn_apply_theta_ref, 0, 1)
+        add_grid_spin(grid_theta_ref, 1, 0, "Vel. rampa (rad/s, 0=degrau)", self.spn_theta_ref_rate)
+        grid_theta_ref.addWidget(self.btn_apply_theta_ref, 0, 1, 2, 1)
 
-        side.addWidget(grp_theta_ref)
+        add_section("theta_ref", "Referência do braço θ", [grp_theta_ref])
 
-        grp_microsteps = QGroupBox("Microsteps do LQR")
+        grp_microsteps = QGroupBox("Modo")
         grid_microsteps = QGridLayout(grp_microsteps)
         grid_microsteps.setHorizontalSpacing(10)
         grid_microsteps.setVerticalSpacing(6)
@@ -469,9 +552,129 @@ class LQRTunerWindow(QWidget):
         grid_microsteps.addWidget(self.cmb_manual_microsteps, 1, 1)
         grid_microsteps.addWidget(self.btn_apply_microstep, 1, 2)
 
-        side.addWidget(grp_microsteps)
+        # Rampa do modo automático: quais níveis participam e quanto tempo em cada.
+        grp_ramp = QGroupBox("Rampa do modo automático")
+        grid_ramp = QGridLayout(grp_ramp)
+        grid_ramp.setHorizontalSpacing(10)
+        grid_ramp.setVerticalSpacing(4)
 
-        grp_obs_poles = QGroupBox("Observador reduzido: polos")
+        for col, text in enumerate(["Micropasso", "Descida", "Tempo", "Subida", "Tempo"]):
+            lbl = QLabel(text)
+            lbl.setStyleSheet("font-weight: bold;")
+            grid_ramp.addWidget(lbl, 0, col)
+
+        self.chk_ramp_down = []
+        self.spn_ramp_down_ms = []
+        self.chk_ramp_up = []
+        self.spn_ramp_up_ms = []
+
+        def ramp_spin(default_ms):
+            spn = QSpinBox()
+            spn.setRange(0, MICROSTEP_RAMP_MAX_MS)
+            spn.setSingleStep(10)
+            spn.setSuffix(" ms")
+            spn.setAlignment(Qt.AlignRight)
+            spn.setKeyboardTracking(False)
+            spn.setValue(default_ms)
+            return spn
+
+        for row, level in enumerate(MICROSTEP_RAMP_LEVELS, start=1):
+            chk_down = QCheckBox()
+            chk_down.setChecked(True)
+            spn_down = ramp_spin(MICROSTEP_RAMP_DOWN_DEFAULT_MS)
+            chk_up = QCheckBox()
+            chk_up.setChecked(True)
+            spn_up = ramp_spin(MICROSTEP_RAMP_UP_DEFAULT_MS)
+
+            chk_down.toggled.connect(spn_down.setEnabled)
+            chk_up.toggled.connect(spn_up.setEnabled)
+
+            grid_ramp.addWidget(QLabel(str(level)), row, 0)
+            grid_ramp.addWidget(chk_down, row, 1)
+            grid_ramp.addWidget(spn_down, row, 2)
+            grid_ramp.addWidget(chk_up, row, 3)
+            grid_ramp.addWidget(spn_up, row, 4)
+
+            self.chk_ramp_down.append(chk_down)
+            self.spn_ramp_down_ms.append(spn_down)
+            self.chk_ramp_up.append(chk_up)
+            self.spn_ramp_up_ms.append(spn_up)
+
+        lbl_ramp_help = QLabel(
+            "256 é sempre o início da descida e o fim da subida. "
+            "Nível desmarcado: a rampa passa direto por ele.\n"
+            "Descida: tempo mínimo no nível antes de descer mais "
+            "(0 = vai direto ao nível pedido pelo fuzzy).\n"
+            "Subida: tempo em cada nível antes de subir para o próximo."
+        )
+        lbl_ramp_help.setWordWrap(True)
+        lbl_ramp_help.setStyleSheet("color: gray;")
+
+        self.btn_apply_ramp = QPushButton("Aplicar rampa")
+
+        last_row = len(MICROSTEP_RAMP_LEVELS) + 1
+        grid_ramp.addWidget(lbl_ramp_help, last_row, 0, 1, 5)
+        grid_ramp.addWidget(self.btn_apply_ramp, last_row + 1, 0, 1, 5)
+
+        add_section("microsteps", "Micropassos", [grp_microsteps, grp_ramp], expanded=True)
+
+        grp_dist = QGroupBox()
+        dist_layout = QGridLayout(grp_dist)
+        self.dist_slider = QSlider(Qt.Horizontal)
+        self.dist_slider.setRange(0, int(AMPLITUDE_MAX * 2))
+        self.dist_slider.setValue(6)
+        self.dist_magnitude = setup_spin(QDoubleSpinBox(), 0, AMPLITUDE_MAX, 1, 0.5)
+        self.dist_magnitude.setSuffix(" rad/s²")
+        self.dist_magnitude.setValue(3)
+        self.dist_slider.valueChanged.connect(lambda v: self.dist_magnitude.setValue(v / 2))
+        self.dist_magnitude.valueChanged.connect(lambda v: self.dist_slider.setValue(round(v * 2)))
+        self.dist_duration = QSpinBox()
+        self.dist_duration.setRange(DURATION_MIN_MS, DURATION_MAX_MS)
+        self.dist_duration.setSingleStep(10)
+        self.dist_duration.setValue(100)
+        self.dist_duration.setSuffix(" ms")
+        self.dist_direction = QComboBox()
+        self.dist_direction.addItems(["Positiva (+)", "Negativa (−)"])
+        self.btn_dist_apply = QPushButton("APLICAR PERTURBAÇÃO")
+        self.btn_dist_apply.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.btn_dist_cancel = QPushButton("CANCELAR PERTURBAÇÃO")
+        self.lbl_dist_state = QLabel("Inativa")
+        self.btn_dist_apply.setEnabled(False)
+        self.btn_dist_cancel.setEnabled(False)
+        self.btn_dist_apply.clicked.connect(self.on_dist_apply)
+        self.btn_dist_cancel.clicked.connect(lambda: self._send_dist_command("DIST CANCEL"))
+        dist_layout.addWidget(QLabel("Próximo pulso"), 0, 0)
+        dist_layout.addWidget(self.dist_slider, 0, 1)
+        dist_layout.addWidget(self.dist_magnitude, 0, 2)
+        dist_layout.addWidget(self.dist_duration, 1, 1)
+        dist_layout.addWidget(self.dist_direction, 1, 2)
+        dist_layout.addWidget(self.btn_dist_apply, 2, 0, 1, 3)
+
+        # Toque em malha aberta: imita um empurrao na ponta do pendulo.
+        self.kick_alpha = setup_spin(QDoubleSpinBox(), KICK_ALPHA_MIN_DEG, KICK_ALPHA_MAX_DEG, 1, 0.5)
+        self.kick_alpha.setSuffix(" °")
+        self.kick_alpha.setValue(5.0)
+        self.kick_alpha.setToolTip("Inclinação do pêndulo ao fim do tranco (sentido = Positiva/Negativa).")
+        self.kick_accel = setup_spin(QDoubleSpinBox(), KICK_ACCEL_MIN, AMPLITUDE_MAX, 0, 10)
+        self.kick_accel.setSuffix(" rad/s²")
+        self.kick_accel.setValue(40)
+        self.kick_accel.setToolTip("Aceleração do braço no tranco (maior = toque mais rápido).\n"
+                                   "Velocidade de pico do braço ≈ √(α0·a/0,46); com 256 micropassos o limite é ~2,8 rad/s.")
+        self.btn_kick_apply = QPushButton("APLICAR TOQUE (α0)")
+        self.btn_kick_apply.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.btn_kick_apply.setEnabled(False)
+        self.btn_kick_apply.clicked.connect(self.on_kick_apply)
+        dist_layout.addWidget(QLabel("Toque"), 3, 0)
+        dist_layout.addWidget(self.kick_alpha, 3, 1)
+        dist_layout.addWidget(self.kick_accel, 3, 2)
+        dist_layout.addWidget(self.btn_kick_apply, 4, 0, 1, 3)
+
+        dist_layout.addWidget(self.btn_dist_cancel, 5, 0, 1, 3)
+        dist_layout.addWidget(self.lbl_dist_state, 6, 0, 1, 3)
+        add_section("dist", "Perturbações experimentais", [grp_dist], expanded=True)
+        self.cur_dist = self.p3.plot(pen=pg.mkPen("m", width=2), name="d(t) solicitado [rad/s²]")
+
+        grp_obs_poles = QGroupBox("Polos")
         grid_obs_poles = QGridLayout(grp_obs_poles)
         grid_obs_poles.setHorizontalSpacing(10)
         grid_obs_poles.setVerticalSpacing(6)
@@ -484,9 +687,7 @@ class LQRTunerWindow(QWidget):
         add_grid_spin(grid_obs_poles, 0, 1, "p2", self.spn_obs_p2)
         grid_obs_poles.addWidget(self.btn_apply_observer, 1, 0, 1, 2)
 
-        side.addWidget(grp_obs_poles)
-
-        grp_obs = QGroupBox("Matrizes OBS calculadas")
+        grp_obs = QGroupBox("Matrizes calculadas")
         grid_obs = QGridLayout(grp_obs)
         grid_obs.setHorizontalSpacing(8)
         grid_obs.setVerticalSpacing(6)
@@ -539,7 +740,7 @@ class LQRTunerWindow(QWidget):
         grid_obs.addWidget(QLabel("[1]"), 4, 3)
         grid_obs.addWidget(self.spn_h1, 4, 4)
 
-        side.addWidget(grp_obs)
+        add_section("observer", "Observador reduzido", [grp_obs_poles, grp_obs])
 
         btn_row3 = QHBoxLayout()
         self.btn_start_collect = QPushButton("Iniciar coleta")
@@ -583,6 +784,7 @@ class LQRTunerWindow(QWidget):
         self.btn_apply_theta_ref.clicked.connect(self.on_apply_theta_ref)
         self.btn_apply_microstep.clicked.connect(self.on_apply_microstep_control)
         self.btn_microstep_auto.clicked.connect(self.on_apply_microstep_control)
+        self.btn_apply_ramp.clicked.connect(self.on_apply_microstep_ramp)
         self.btn_apply_observer.clicked.connect(self.on_apply_observer)
         self.btn_start.clicked.connect(self.on_start)
         self.btn_stop.clicked.connect(self.on_stop)
@@ -618,6 +820,12 @@ class LQRTunerWindow(QWidget):
         microsteps = cfg.get("microsteps", {})
         observer = cfg.get("observer_poles", {})
         lim = cfg.get("limits", {})
+        dist = cfg.get("disturbance", {})
+        self.dist_magnitude.setValue(float(dist.get("magnitude_rad_s2", 3)))
+        self.dist_duration.setValue(int(dist.get("duration_ms", 100)))
+        self.dist_direction.setCurrentIndex(int(bool(dist.get("negative", False))))
+        self.kick_alpha.setValue(float(dist.get("kick_alpha_deg", 5.0)))
+        self.kick_accel.setValue(float(dist.get("kick_accel_rad_s2", 40.0)))
 
         self.spn_q_theta.setValue(float(lqr_qr.get("q_theta", 5.0)))
         self.spn_q_alpha.setValue(float(lqr_qr.get("q_alpha", 300.0)))
@@ -643,6 +851,7 @@ class LQRTunerWindow(QWidget):
         )
 
         self.spn_theta_target_deg.setValue(theta_target_deg)
+        self.spn_theta_ref_rate.setValue(float(theta_ref.get("rate_rad_s", 0.6)))
         self.theta_ref_applied_deg = 0.0
 
         microstep_auto_enabled = bool(microsteps.get("auto_enabled", True))
@@ -654,6 +863,25 @@ class LQRTunerWindow(QWidget):
         self.btn_microstep_auto.setChecked(microstep_auto_enabled)
         self.cmb_manual_microsteps.setCurrentText(str(microstep_manual))
         self._sync_microstep_ui()
+
+        self._load_ramp_ui(
+            microsteps.get("ramp_down", {}),
+            self.chk_ramp_down,
+            self.spn_ramp_down_ms,
+            MICROSTEP_RAMP_DOWN_DEFAULT_MS,
+        )
+        self._load_ramp_ui(
+            microsteps.get("ramp_up", {}),
+            self.chk_ramp_up,
+            self.spn_ramp_up_ms,
+            MICROSTEP_RAMP_UP_DEFAULT_MS,
+        )
+
+        sections = cfg.get("ui", {}).get("sections", {})
+
+        for key, section in self.sections.items():
+            if key in sections:
+                section.set_expanded(bool(sections[key]))
 
         try:
             self._calculate_lqr_only()
@@ -700,89 +928,196 @@ class LQRTunerWindow(QWidget):
     def _start_reader_thread(self):
         def reader():
             while not self.stop_reader:
-                if not serial_is_open():
-                    time.sleep(0.1)
-                    continue
-
-                try:
-                    if self.serial_command_active.is_set():
-                        time.sleep(0.005)
-                        continue
-
-                    with self.serial_lock:
-                        line = read_line()
-
-                    if not line:
-                        continue
-
-                    if line.startswith("T,"):
-                        sample = decode_telemetry(line)
-
-                        if sample is None:
-                            continue
-
-                        if not self._sample_is_valid(sample):
-                            continue
-
-                        self.buf_t.append(sample["t_s"])
-                        self.buf["A"].append(sample["alpha_deg"])
-                        self.buf["TH"].append(sample["theta_deg"])
-                        self.buf["AD"].append(sample["alpha_dot_deg_s"])
-                        self.buf["TD"].append(sample["theta_dot_deg_s"])
-                        self.buf["U"].append(sample["u_rad_s2"])
-                        self.buf["VEL"].append(sample["vel_rad_s"])
-                        self.buf["EN"].append(sample["enabled"])
-
-                        if self.top_calib_active:
-                            with self.top_calib_lock:
-                                self.top_calib_samples.append(
-                                    (sample["alpha_deg"], sample["enabled"])
-                                )
-
-                        if self.is_collecting and self.collect_writer is not None:
-                            if self.collect_start_t is None:
-                                self.collect_start_t = sample["t_s"]
-
-                            self.collect_writer.writerow([
-                                sample["t_s"] - self.collect_start_t,
-                                sample["alpha_deg"],
-                                sample["theta_deg"],
-                                sample["alpha_dot_deg_s"],
-                                sample["theta_dot_deg_s"],
-                                sample["u_rad_s2"],
-                                sample["vel_rad_s"],
-                                sample["enabled"],
-                                self.collect_meta.get("q_theta", math.nan),
-                                self.collect_meta.get("q_alpha", math.nan),
-                                self.collect_meta.get("q_theta_dot", math.nan),
-                                self.collect_meta.get("q_alpha_dot", math.nan),
-                                self.collect_meta.get("r", math.nan),
-                                self.collect_meta.get("k_theta", math.nan),
-                                self.collect_meta.get("k_alpha", math.nan),
-                                self.collect_meta.get("k_theta_dot", math.nan),
-                                self.collect_meta.get("k_alpha_dot", math.nan),
-                                self.collect_meta.get("theta_target_deg", math.nan),
-                                self.collect_meta.get("microstep_auto_enabled", math.nan),
-                                self.collect_meta.get("microstep_manual", math.nan),
-                                self.collect_meta.get("observer_p1", math.nan),
-                                self.collect_meta.get("observer_p2", math.nan),
-                            ])
-
-                            self.collect_file.flush()
-
-                    else:
-                        if len(self.log_buf) < 500:
-                            self.log_buf.append(line)
-
-                except Exception:
+                if not serial_is_open() or self.serial_command_active.is_set():
                     time.sleep(0.01)
-
+                    continue
+                try:
+                    with self.serial_lock:
+                        if self.serial_command_active.is_set():
+                            continue
+                        line = read_line()
+                        if line:
+                            self.rx_lines.put(line)
+                except Exception as exc:
+                    self.rx_lines.put(f"[SERIAL ERROR] {exc}")
+                    with self.serial_lock:
+                        close_serial()
+                    time.sleep(0.1)
         threading.Thread(target=reader, daemon=True).start()
+
+    def _process_serial_line(self, line):
+        if line.startswith("DIST "):
+            self._process_disturbance(line)
+            return
+        if line.startswith("T,"):
+            sample = decode_telemetry(line)
+
+            if sample is None:
+                return
+
+            if not self._sample_is_valid(sample):
+                return
+
+            if math.isfinite(sample["firmware_t_us"]):
+                sample["t_s"] = sample["firmware_t_us"] / 1e6
+
+            if not self._accept_sample_time(sample["t_s"]):
+                return
+            self.buf_t.append(sample["t_s"])
+            self.buf["A"].append(sample["alpha_deg"])
+            self.buf["TH"].append(sample["theta_deg"])
+            self.buf["AD"].append(sample["alpha_dot_deg_s"])
+            self.buf["TD"].append(sample["theta_dot_deg_s"])
+            self.buf["U"].append(sample["u_rad_s2"])
+            self.buf["VEL"].append(sample["vel_rad_s"])
+            self.buf["EN"].append(sample["enabled"])
+            self.buf["D"].append(sample["d_rad_s2"])
+            self.buf["TR"].append(sample.get("theta_ref_deg", math.nan))
+
+            if self.top_calib_active:
+                with self.top_calib_lock:
+                    self.top_calib_samples.append(
+                        (sample["alpha_deg"], sample["enabled"])
+                    )
+
+            if self.is_collecting and self.collect_writer is not None:
+                if self.collect_start_t is None:
+                    self.collect_start_t = sample["t_s"]
+
+                self.collect_writer.writerow([
+                    sample["t_s"] - self.collect_start_t,
+                    sample["alpha_deg"],
+                    sample["theta_deg"],
+                    sample["alpha_dot_deg_s"],
+                    sample["theta_dot_deg_s"],
+                    sample["u_rad_s2"],
+                    sample["vel_rad_s"],
+                    sample["enabled"],
+                    self.collect_meta.get("q_theta", math.nan),
+                    self.collect_meta.get("q_alpha", math.nan),
+                    self.collect_meta.get("q_theta_dot", math.nan),
+                    self.collect_meta.get("q_alpha_dot", math.nan),
+                    self.collect_meta.get("r", math.nan),
+                    self.collect_meta.get("k_theta", math.nan),
+                    self.collect_meta.get("k_alpha", math.nan),
+                    self.collect_meta.get("k_theta_dot", math.nan),
+                    self.collect_meta.get("k_alpha_dot", math.nan),
+                    self.collect_meta.get("theta_target_deg", math.nan),
+                    self.collect_meta.get("microstep_auto_enabled", math.nan),
+                    self.collect_meta.get("microstep_manual", math.nan),
+                    self.collect_meta.get("observer_p1", math.nan),
+                    self.collect_meta.get("observer_p2", math.nan),
+                    *[sample.get(key, math.nan) for key in EXPERIMENT_COLUMNS],
+                ])
+
+                # flush() a cada linha (50 Hz) deixa a GUI lenta, principalmente
+                # em pasta sincronizada; o arquivo e fechado ao parar a coleta.
+                now = time.monotonic()
+                if now - self._last_flush >= 1.0:
+                    self.collect_file.flush()
+                    self._last_flush = now
+
+        else:
+            if len(self.log_buf) < 500:
+                self.log_buf.append(line)
+
+
+    def _accept_sample_time(self, t):
+        """Descarta amostras fora de ordem/saltos (lixo ou atraso na serial)."""
+        last = self._last_sample_t
+        if last is None or 0.0 < t - last < 2.0:
+            self._last_sample_t = t
+            self._time_rejects = 0
+            return True
+        self._time_rejects += 1
+        if self._time_rejects < 25:
+            return False
+        # ~0,5 s sem nada coerente: o ESP reiniciou ou a conexao mudou.
+        if t < last:
+            self.buf_t.clear()
+            for values in self.buf.values():
+                values.clear()
+        self._last_sample_t = t
+        self._time_rejects = 0
+        return True
 
     def _start_timer(self):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start(int(1000 / GUI_HZ))
+
+    def _drain_received_lines(self):
+        while not self.rx_lines.empty():
+            self._process_serial_line(self.rx_lines.get_nowait())
+
+    def _write_experiment_metadata(self):
+        if self.collect_json_path is not None:
+            self.collect_json_path.write_text(json.dumps({
+                "schema": "furuta-disturbance-v1",
+                "configuration": self.collect_meta,
+                "events": self.collect_events,
+            }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def on_dist_apply(self):
+        amplitude = self.dist_magnitude.value()
+        if self.dist_direction.currentIndex() == 1:
+            amplitude = -amplitude
+        self._send_dist_command(pulse_command(amplitude, self.dist_duration.value()))
+
+    def on_kick_apply(self):
+        alpha0 = self.kick_alpha.value()
+        if self.dist_direction.currentIndex() == 1:
+            alpha0 = -alpha0
+        try:
+            command = kick_command(alpha0, self.kick_accel.value())
+        except ValueError as e:
+            QMessageBox.warning(self, "Toque", str(e))
+            return
+        self._send_dist_command(command)
+
+    def _send_dist_command(self, command):
+        if not serial_is_open() or self.cmd_thread is not None:
+            return
+        self.lbl_dist_state.setText("Solicitação enviada")
+        self.dist_pending_at = time.monotonic()
+        self._run_serial_commands_async([(command, None)], "Perturbação")
+
+    def _process_disturbance(self, line):
+        event = decode_disturbance(line)
+        if event is None:
+            self._log(f"[DIST inválido] {line}")
+            return
+        self._log(line)
+        self.dist_pending_at = None
+        if self.is_collecting:
+            self.collect_events.append(event)
+            self._write_experiment_metadata()
+        kind, code = event["kind"], event["code"]
+        if kind == "ERR":
+            self.lbl_dist_state.setText(f"Rejeitada: {code}")
+            return
+        states = {"IDLE": "Inativa", "PENDING": "Aceita — aguardando pêndulo parado",
+                  "ACTIVE": "Aplicando", "ENDED": "Concluída", "CANCELLED": "Cancelada"}
+        self.lbl_dist_state.setText(f"{states[event['state']]} (#{event['id']}, {code})")
+        pulse_id = event["id"]
+        if event["start_us"] > 0 and (kind == "EVENT" or
+                (kind == "STATUS" and event["state"] == "ACTIVE")):
+            start = event["start_us"] / 1e6
+            end = event["t_us"] / 1e6
+            region = self.dist_regions.get(pulse_id)
+            if region is None:
+                # Toque (kick) em ciano; pulso de aceleracao em magenta.
+                color = (0, 200, 255, 55) if event.get("kick") else (255, 0, 200, 45)
+                region = pg.LinearRegionItem((start, end), movable=False,
+                                             brush=pg.mkBrush(*color))
+                region.setZValue(-5)
+                self.p1.addItem(region)
+                self.dist_regions[pulse_id] = region
+            region.setRegion((start, end))
+            # Bound plot memory for long experiments; JSON retains every event.
+            while len(self.dist_regions) > 100:
+                first = next(iter(self.dist_regions))
+                self.p1.removeItem(self.dist_regions.pop(first))
 
     def _current_vals(self):
         return {
@@ -798,14 +1133,23 @@ class LQRTunerWindow(QWidget):
             "k_alpha_dot": self.spn_k_alpha_dot.value(),
 
             "theta_target_deg": self.spn_theta_target_deg.value(),
+            "theta_ref_rate_rad_s": self.spn_theta_ref_rate.value(),
 
             "microstep_auto_enabled": self.btn_microstep_auto.isChecked(),
             "microstep_manual": int(self.cmb_manual_microsteps.currentText()),
+            "microstep_ramp_levels": list(MICROSTEP_RAMP_LEVELS),
+            "microstep_ramp_down": self._ramp_vals(self.chk_ramp_down, self.spn_ramp_down_ms),
+            "microstep_ramp_up": self._ramp_vals(self.chk_ramp_up, self.spn_ramp_up_ms),
 
             "observer_p1": self.spn_obs_p1.value(),
             "observer_p2": self.spn_obs_p2.value(),
 
             "accel_max_rad_s2": self.accel_max_rad_s2,
+            "dist_magnitude": self.dist_magnitude.value(),
+            "dist_duration_ms": self.dist_duration.value(),
+            "dist_negative": self.dist_direction.currentIndex() == 1,
+            "kick_alpha_deg": self.kick_alpha.value(),
+            "kick_accel_rad_s2": self.kick_accel.value(),
         }
 
     def _log(self, text):
@@ -861,6 +1205,71 @@ class LQRTunerWindow(QWidget):
 
         return matrices
 
+    @staticmethod
+    def _ramp_vals(checks, spins):
+        return {
+            "enabled": [chk.isChecked() for chk in checks],
+            "ms": [spn.value() for spn in spins],
+        }
+
+    @staticmethod
+    def _load_ramp_ui(ramp, checks, spins, default_ms):
+        enabled = list(ramp.get("enabled", []))
+        times = list(ramp.get("ms", []))
+
+        for i, (chk, spn) in enumerate(zip(checks, spins)):
+            chk.setChecked(bool(enabled[i]) if i < len(enabled) else True)
+            ms = int(times[i]) if i < len(times) else default_ms
+            spn.setValue(max(0, min(MICROSTEP_RAMP_MAX_MS, ms)))
+            spn.setEnabled(chk.isChecked())
+
+    @staticmethod
+    def _ramp_command(prefix, ramp):
+        flags = " ".join("1" if en else "0" for en in ramp["enabled"])
+        times = " ".join(str(int(ms)) for ms in ramp["ms"])
+        return f"{prefix} {flags} {times}"
+
+    def _microstep_ramp_commands(self, vals):
+        return [
+            (self._ramp_command("MSRD", vals["microstep_ramp_down"]), "MSRD"),
+            (self._ramp_command("MSRU", vals["microstep_ramp_up"]), "MSRU"),
+        ]
+
+    @Slot(str, bool)
+    def _on_section_toggled(self, key, expanded):
+        try:
+            save_ui_sections({k: s.is_expanded() for k, s in self.sections.items()})
+        except Exception as e:
+            self._log(f"[WARN] não salvou o estado das seções: {e}")
+
+    def on_apply_microstep_ramp(self):
+        if not serial_is_open():
+            QMessageBox.warning(self, "Serial", "Conecte a porta serial primeiro.")
+            return
+
+        vals = self._current_vals()
+
+        if not any(vals["microstep_ramp_down"]["enabled"]):
+            QMessageBox.warning(
+                self,
+                "Rampa de micropassos",
+                "Marque pelo menos um nível na descida."
+            )
+            return
+
+        def after_success():
+            save_config(vals)
+            self._log(
+                "[TROCA] rampa aplicada | "
+                f"descida={vals['microstep_ramp_down']} subida={vals['microstep_ramp_up']}"
+            )
+
+        self._run_serial_commands_async(
+            self._microstep_ramp_commands(vals),
+            "Erro rampa de micropassos",
+            after_success
+        )
+
     def _sync_microstep_ui(self):
         auto_enabled = self.btn_microstep_auto.isChecked()
         self.btn_microstep_auto.setText(
@@ -874,6 +1283,7 @@ class LQRTunerWindow(QWidget):
         self.btn_apply_observer.setEnabled(enabled)
         self.btn_apply_microstep.setEnabled(enabled)
         self.btn_microstep_auto.setEnabled(enabled)
+        self.btn_apply_ramp.setEnabled(enabled)
         self.btn_start.setEnabled(enabled)
         self.btn_stop.setEnabled(enabled)
         self.btn_rth.setEnabled(enabled)
@@ -901,7 +1311,7 @@ class LQRTunerWindow(QWidget):
         self._set_command_buttons_enabled(False)
 
         self.cmd_thread = QThread(self)
-        self.cmd_worker = SerialCommandWorker(commands, self.serial_lock)
+        self.cmd_worker = SerialCommandWorker(commands, self.serial_lock, self.rx_lines.put)
 
         self.cmd_worker.moveToThread(self.cmd_thread)
 
@@ -969,6 +1379,10 @@ class LQRTunerWindow(QWidget):
 
         try:
             open_serial(port)
+            self._last_sample_t = None
+            self._time_rejects = 0
+            self.lbl_dist_state.setText("Inativa — consultando firmware")
+            self._send_dist_command("DIST?")
             self.lbl_serial_status.setText(f"Conectado em {port}")
             self._log(f"[INFO] conectado em {port}")
             self.btn_connect.setEnabled(False)
@@ -996,7 +1410,10 @@ class LQRTunerWindow(QWidget):
                 self.on_stop_collect()
 
             port = self.cmb_port.currentText().strip()
-            close_serial()
+            with self.serial_lock:
+                close_serial()
+            self.dist_pending_at = None
+            self.lbl_dist_state.setText("Inativa — desconectado; estado remoto desconhecido")
 
             self.lbl_serial_status.setText("Desconectado")
             self._log(
@@ -1084,6 +1501,7 @@ class LQRTunerWindow(QWidget):
         try:
             vals = self._current_vals()
             theta_deg = vals["theta_target_deg"]
+            rate = vals["theta_ref_rate_rad_s"]
             cmd = f"TH {theta_deg:.3f}"
 
             def after_success():
@@ -1091,10 +1509,13 @@ class LQRTunerWindow(QWidget):
                 # A coleta registra o alvo atual, nao o do inicio da coleta
                 if self.is_collecting:
                     self.collect_meta["theta_target_deg"] = theta_deg
+                    self.collect_meta["theta_ref_rate_rad_s"] = rate
+                    self._write_experiment_metadata()
                 save_config(vals)
 
+            # Velocidade primeiro, para a rampa ja comecar com o valor novo.
             self._run_serial_commands_async(
-                [(cmd, "TH")],
+                [(f"THV {rate:.3f}", "THV"), (cmd, "TH ")],
                 "Erro",
                 after_success
             )
@@ -1153,6 +1574,7 @@ class LQRTunerWindow(QWidget):
             commands = [
                 (f"MSMAN {manual_microsteps}", "MSMAN"),
                 (f"MSAUTO {1 if auto_enabled else 0}", "MSAUTO"),
+                *self._microstep_ramp_commands(vals),
                 (self.last_lqr_cmd, "LQR"),
                 (matrices.cmd_olr(), "OLR"),
                 (matrices.cmd_of(), "OF"),
@@ -1382,6 +1804,14 @@ class LQRTunerWindow(QWidget):
             self._calculate_observer_only()
 
             self.collect_meta = self._current_vals()
+            self.collect_meta["settings_source"] = "GUI requested; MA/MS/GP in CSV are firmware observations"
+            self.collect_meta["observer_input"] = "previous total requested acceleration, not measured"
+            self.collect_meta["gain_profile_1"] = [-13.454442, 535.967467, -15.876477, 86.634851]
+            self.collect_meta["telemetry_hz"] = 50
+            self.collect_meta["created_at"] = datetime.now().astimezone().isoformat()
+            self.collect_events = []
+            self.collect_json_path = filepath.with_suffix(".json")
+            self._write_experiment_metadata()
             self.collect_file = filepath.open("w", newline="", encoding="utf-8")
             self.collect_writer = csv.writer(self.collect_file)
 
@@ -1408,6 +1838,7 @@ class LQRTunerWindow(QWidget):
                 "microstep_manual",
                 "observer_p1",
                 "observer_p2",
+                *EXPERIMENT_COLUMNS,
             ])
 
             self.collect_start_t = None
@@ -1436,6 +1867,8 @@ class LQRTunerWindow(QWidget):
             return
 
         try:
+            self._drain_received_lines()
+            self._write_experiment_metadata()
             self.is_collecting = False
             self.collect_writer = None
 
@@ -1463,6 +1896,14 @@ class LQRTunerWindow(QWidget):
         return xmin + 0.02 * xr, ymax - 0.05 * yr
 
     def on_timer(self):
+        self._drain_received_lines()
+        connected = serial_is_open()
+        self.btn_dist_apply.setEnabled(connected and self.cmd_thread is None and not self.top_calib_active)
+        self.btn_kick_apply.setEnabled(self.btn_dist_apply.isEnabled())
+        self.btn_dist_cancel.setEnabled(connected and self.cmd_thread is None)
+        if self.dist_pending_at is not None and time.monotonic() - self.dist_pending_at > 2:
+            self.lbl_dist_state.setText("Sem confirmação — consulte DIST? (estado desconhecido)")
+            self.dist_pending_at = None
         if self.buf_t:
             t1 = self.buf_t[-1]
             t0 = max(self.buf_t[0], t1 - WIN_SEC)
@@ -1480,12 +1921,18 @@ class LQRTunerWindow(QWidget):
             en = list(self.buf["EN"])
 
             theta_ref = self.theta_ref_applied_deg
-            theta_ref_list = [theta_ref] * len(t_list)
+            # Usa o theta_ref real da rampa (telemetria TR) quando disponivel.
+            tr = list(self.buf["TR"])
+            if tr and all(math.isfinite(v) for v in tr[-5:]):
+                theta_ref_list = [v if math.isfinite(v) else theta_ref for v in tr]
+            else:
+                theta_ref_list = [theta_ref] * len(t_list)
 
             self.cur_alpha.setData(t_list, alpha)
             self.cur_theta.setData(t_list, theta)
             self.cur_theta_ref.setData(t_list, theta_ref_list)
 
+            self.cur_dist.setData(t_list, list(self.buf["D"]))
             self.cur_u.setData(t_list, u)
             self.cur_vel.setData(t_list, vel)
 

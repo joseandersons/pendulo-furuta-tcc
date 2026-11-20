@@ -38,6 +38,7 @@ def save_config(vals):
 
     cfg["theta_ref"] = {
         "theta_target_deg": float(vals.get("theta_target_deg", 0.0)),
+        "rate_rad_s": float(vals.get("theta_ref_rate_rad_s", 0.6)),
     }
 
     cfg["observer_poles"] = {
@@ -45,15 +46,49 @@ def save_config(vals):
         "p2": float(vals.get("observer_p2", -28.0)),
     }
 
-    cfg["microsteps"] = {
+    microsteps = {
         "auto_enabled": bool(vals.get("microstep_auto_enabled", True)),
         "manual": int(vals.get("microstep_manual", 256)),
     }
+
+    for key in ("ramp_down", "ramp_up"):
+        ramp = vals.get(f"microstep_ramp_{key[5:]}")
+
+        if ramp is not None:
+            microsteps[key] = {
+                "enabled": [bool(en) for en in ramp["enabled"]],
+                "ms": [int(ms) for ms in ramp["ms"]],
+            }
+        elif key in cfg.get("microsteps", {}):
+            microsteps[key] = cfg["microsteps"][key]
+
+    cfg["microsteps"] = microsteps
 
     cfg["limits"] = {
         "accel_max_rad_s2": float(vals.get("accel_max_rad_s2", 30.0)),
     }
 
+    cfg["disturbance"] = {
+        "magnitude_rad_s2": float(vals.get("dist_magnitude", 3.0)),
+        "duration_ms": int(vals.get("dist_duration_ms", 100)),
+        "negative": bool(vals.get("dist_negative", False)),
+        "kick_alpha_deg": float(vals.get("kick_alpha_deg", 5.0)),
+        "kick_accel_rad_s2": float(vals.get("kick_accel_rad_s2", 40.0)),
+    }
+
+    _write_config(cfg)
+
+
+def save_ui_sections(sections):
+    """Guarda quais seções da barra lateral estão abertas."""
+    cfg = load_config()
+    cfg.setdefault("ui", {})["sections"] = {
+        str(k): bool(v) for k, v in sections.items()
+    }
+    _write_config(cfg)
+
+
+def _write_config(cfg):
     CONFIG_PATH.write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False),
         encoding="utf-8"

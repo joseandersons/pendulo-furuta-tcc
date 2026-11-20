@@ -11,6 +11,28 @@
 
 
 #define PERIOD_CONTROL_MS 2
+
+// Experimental input pulses: initial calibration limits, not hardware validated.
+// Durante um pulso o motor usa max(ARM_ACCEL_MAX, este valor) como limite;
+// fora do pulso o LQR continua limitado a ARM_ACCEL_MAX_RAD_S2.
+#define DIST_AMPLITUDE_MAX_RAD_S2 1000.0f
+#define DIST_DURATION_MIN_MS 20u
+#define DIST_DURATION_MAX_MS 3000u
+#define DIST_SAFE_ALPHA_RAD 0.1745329252f // 10 degrees at acceptance/start
+#define DIST_CONTROL_FRESH_US 20000LL
+
+// Toque em malha aberta (DIST KICK <alpha0_graus> <accel_rad_s2>): imita um
+// empurrao na ponta do pendulo. Com o pendulo calmo, o LQR e suspenso e o
+// braco faz um tranco +a / -a (velocidade final ~0); a fase 1 dura ate o
+// pendulo inclinar alpha0/2, a fase 2 freia pelo mesmo tempo. Ao final o
+// pendulo esta inclinado ~alpha0 e o LQR assume para recuperar.
+#define KICK_ALPHA_MIN_DEG 0.5f
+#define KICK_ALPHA_MAX_DEG 15.0f
+#define KICK_ACCEL_MIN_RAD_S2 10u
+#define KICK_PHASE_MAX_MS 250u                   // limite de seguranca da fase 1
+#define DIST_START_CALM_ALPHA_RAD 0.0087266f        // toque so comeca com |alpha| <= 0,5 grau
+#define DIST_START_CALM_ALPHA_DOT_RAD_S 0.0872665f  // e |alpha_dot| <= 5 graus/s
+#define DIST_START_TIMEOUT_MS 3000u                 // senao, cancela (EVENT TIMEOUT)
 #define PERIOD_ENCODER_MS 2
 #define MOTOR_UPDATE_MS 2
 
@@ -43,7 +65,7 @@
 #define MOTOR_MICROSTEPS TMC2209_MICROSTEPS
 #define MOTOR_GEAR_RATIO 1.0f
 
-#define ARM_ACCEL_MAX_RAD_S2 120.0f
+#define ARM_ACCEL_MAX_RAD_S2 200.0f
 
 #define ALPHA_ENABLE_RAD 0.261799f // 15 degrees
 //#define ALPHA_ENABLE_RAD 0.174533f // 10 degrees
@@ -90,6 +112,12 @@
 #define LQR_DISTURBANCE_MICROSTEPS 16
 #define LQR_MANUAL_MICROSTEPS_DEFAULT 256
 
+// 0 = o modo automatico usa sempre os ganhos da interface, iguais ao manual,
+//     em qualquer micropasso (so o micropasso muda entre os modos).
+// 1 = usa LQR_GAINS_DISTURBANCE_16 (lqr.cpp) quando o nivel e <= 64.
+//     Na coleta de 24/10 esse perfil era ~30% mais fraco em k_alpha/k_alpha_dot.
+#define LQR_USE_DISTURBANCE_GAINS 0
+
 // Supervisor fuzzy de micropassos durante o LQR.
 // e_alpha pequeno: ate 2 graus; medio: 3 a 4 graus; grande: 5+ graus.
 #define FUZZY_ALPHA_SMALL_FULL_DEG 2.0f
@@ -112,6 +140,14 @@
 // Retencao e rearme para evitar falso disturbio durante o retorno para o zero.
 #define LQR_DISTURBANCE_HOLD_MS 1000
 #define LQR_MICROSTEP_RAMP_INTERVAL_MS 200
+
+// Rampa de micropassos do modo automatico (niveis 128, 64, 32, 16; 256 e sempre
+// o inicio da descida e o fim da subida). Ajustavel pela interface com MSRD/MSRU.
+// Descida: tempo minimo em cada nivel antes de descer ao proximo (0 = passa direto).
+// Subida: tempo em cada nivel antes de subir ao proximo.
+#define LQR_MICROSTEP_RAMP_DOWN_DEFAULT_MS 0
+#define LQR_MICROSTEP_RAMP_UP_DEFAULT_MS LQR_MICROSTEP_RAMP_INTERVAL_MS
+#define LQR_MICROSTEP_RAMP_MAX_MS 100000
 #define LQR_DISTURBANCE_REARM_BLOCK_MS 1200
 #define LQR_DISTURBANCE_REARM_STABLE_MS 350
 #define LQR_DISTURBANCE_REARM_ALPHA_DEG 1.0f
@@ -120,7 +156,7 @@
 
 #define SWING_UP_MICROSTEPS 16
 
-#define THETA_REF_RATE_LIMIT_RAD_S 0.60f
+#define THETA_REF_RATE_LIMIT_RAD_S 0.60f   // valor inicial; ajustavel com THV <rad/s> (0 = degrau, sem limite superior)
 
 // Calibracao do zero do pendulo no topo (comando ZTOP, botao na interface).
 // Taxa com que o controle passa ao novo zero: 2 contagens/s ~ 0.18 graus/s.

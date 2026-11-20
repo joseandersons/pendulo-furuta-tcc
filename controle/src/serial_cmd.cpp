@@ -12,6 +12,8 @@
 #include "microstep_control.h"
 #include "calibration.h"
 #include "autozero.h"
+#include "disturbance.h"
+#include <esp_timer.h>
 
 static float cmd_deg_to_rad(float deg) {
   return deg * 0.017453292519943295f;
@@ -26,6 +28,7 @@ static void serial_cmd_task(void*) {
 
   static char buf[200];
   size_t n = 0;
+  bool overflow = false;
 
   for (;;) {
     {
@@ -39,8 +42,17 @@ static void serial_cmd_task(void*) {
     while (Serial.available()) {
       char c = (char)Serial.read();
 
-      if (c == '\n' || n >= sizeof(buf) - 1) {
+      if (c == '\n') {
         buf[n] = 0;
+
+        if (overflow) {
+          // Never execute a truncated prefix, including a valid pulse + garbage.
+          if (strncmp(buf, "DIST", 4) == 0) disturbance_command("DIST INVALID", esp_timer_get_time());
+          else Serial.println("ERR LINE_TOO_LONG");
+          n = 0;
+          overflow = false;
+          continue;
+        }
 
         if (n) {
           float k_theta;
@@ -61,7 +73,9 @@ static void serial_cmd_task(void*) {
           int ms_manual;
           float ztop_deg;
 
-          if (sscanf(
+          if (disturbance_command(buf, esp_timer_get_time())) {
+            // Responses/events are drained by serial_tx, never by the control loop.
+          } else if (sscanf(
                 buf,
                 "LQR %f %f %f %f",
                 &k_theta,
@@ -124,6 +138,14 @@ static void serial_cmd_task(void*) {
               motor_get_accel_max_rad_s2()
             );
 
+          } else if (sscanf(buf, "THV %f", &theta_rad) == 1) {
+            // Velocidade da rampa de theta_ref (rad/s); 0 = degrau.
+            control_set_theta_ref_rate_rad_s(theta_rad);
+            Serial.printf("THV rate=%.3f rad/s\n", control_get_theta_ref_rate_rad_s());
+
+          } else if (strcmp(buf, "THV?") == 0) {
+            Serial.printf("THV rate=%.3f rad/s\n", control_get_theta_ref_rate_rad_s());
+
           } else if (sscanf(buf, "TH %f", &theta_deg) == 1) {
             theta_rad = cmd_deg_to_rad(theta_deg);
             control_set_theta_target_rad(theta_rad);
@@ -151,6 +173,7 @@ static void serial_cmd_task(void*) {
             );
 
           } else if (strcmp(buf, "RTH") == 0) {
+            disturbance_reset(esp_timer_get_time(), "RESET");
             encoder_reset_braco_zero();
             motor_reset_theta_est();
             control_reset_theta_reference();
@@ -167,6 +190,38 @@ static void serial_cmd_task(void*) {
             if (!microstep_control_set_manual_microsteps((uint16_t)ms_manual)) {
               Serial.println("ERR MSMAN");
             }
+
+          } else if (strncmp(buf, "MSRD ", 5) == 0 || strncmp(buf, "MSRU ", 5) == 0) {
+            // Rampa de micropassos: en128 en64 en32 en16 t128 t64 t32 t16 (ms)
+            const bool down = buf[3] == 'D';
+            int en[MICROSTEP_RAMP_LEVELS_COUNT];
+            int ms[MICROSTEP_RAMP_LEVELS_COUNT];
+            bool ok = sscanf(
+              buf + 5,
+              "%d %d %d %d %d %d %d %d",
+              &en[0], &en[1], &en[2], &en[3],
+              &ms[0], &ms[1], &ms[2], &ms[3]
+            ) == 8;
+
+            bool enabled[MICROSTEP_RAMP_LEVELS_COUNT];
+            uint32_t times[MICROSTEP_RAMP_LEVELS_COUNT];
+
+            for (uint8_t i = 0; ok && i < MICROSTEP_RAMP_LEVELS_COUNT; i++) {
+              ok = (en[i] == 0 || en[i] == 1) &&
+                   ms[i] >= 0 && ms[i] <= LQR_MICROSTEP_RAMP_MAX_MS;
+              enabled[i] = en[i] == 1;
+              times[i] = (uint32_t)ms[i];
+            }
+
+            if (ok && microstep_control_set_ramp(down, enabled, times)) {
+              microstep_control_print_ramp(down);
+            } else {
+              Serial.println(down ? "ERR MSRD" : "ERR MSRU");
+            }
+
+          } else if (strcmp(buf, "MSR?") == 0) {
+            microstep_control_print_ramp(true);
+            microstep_control_print_ramp(false);
 
           } else if (strcmp(buf, "MS?") == 0) {
             Serial.printf(
@@ -200,6 +255,7 @@ static void serial_cmd_task(void*) {
             );
 
           } else if (sscanf(buf, "ZTOP %f", &ztop_deg) == 1) {
+            disturbance_reset(esp_timer_get_time(), "CALIBRATION");
             if (calibrar_zero_ajuste_topo(ztop_deg)) {
               Serial.printf(
                 "ZTOP OK delta=%.4f alvo=%.3f\n",
@@ -248,7 +304,8 @@ static void serial_cmd_task(void*) {
         n = 0;
 
       } else if (c != '\r') {
-        buf[n++] = c;
+        if (n < sizeof(buf) - 1) buf[n++] = c;
+        else overflow = true;
       }
     }
 

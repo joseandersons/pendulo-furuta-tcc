@@ -11,12 +11,27 @@ Construção, modelagem e controle experimental de um **pêndulo invertido rotac
   <img src="docs/images/plataforma_cad.png" alt="Modelo 3D da plataforma" width="380">
 </p>
 
+<p align="center">
+  <img src="docs/images/demo_swingup_captura.gif" alt="Swing-up e captura do pêndulo pelo LQR" width="480"><br>
+  <em>Swing-up e captura da haste pelo LQR.</em>
+</p>
+
+### Vídeo da demonstração
+
+<p align="center">
+  <a href="https://youtu.be/ZCMLQUc0vxM">
+    <img src="docs/images/miniatura_video.png" alt="Assistir ao vídeo da demonstração no YouTube" width="640">
+  </a><br>
+  <em><a href="https://youtu.be/ZCMLQUc0vxM">▶ Assistir no YouTube</a> (3:17): calibração, swing-up, captura pelo LQR, reposicionamento do braço em 90°, 0° e −90° e rejeição a pulsos de aceleração.</em>
+</p>
+
 ---
 
 ## Sumário
 
 - [Como o pêndulo funciona](#como-o-pêndulo-funciona)
 - [Resultados](#resultados)
+- [Sobre este repositório](#sobre-este-repositório)
 - [Lista de materiais](#lista-de-materiais)
 - [Ligações elétricas](#ligações-elétricas)
 - [Estrutura do repositório](#estrutura-do-repositório)
@@ -88,17 +103,33 @@ O firmware roda sobre **FreeRTOS** nos dois núcleos do ESP32:
 
 ## Resultados
 
-<p align="center">
-  <img src="docs/images/swingup_captura_ref0.png" alt="Swing-up e captura" width="420">
-  &nbsp;&nbsp;
-  <img src="docs/images/degrau_braco_0_a_90.png" alt="Reposicionamento do braço em 90 graus" width="420">
-</p>
+Foram realizados três ensaios na bancada, todos com o LQR discreto e o observador de ordem reduzida executados a 500 Hz no ESP32.
 
 | Ensaio | Resultado |
 |---|---|
-| Captura após o swing-up | LQR habilitado com α = −13,65°; haste a menos de 1° da vertical em **2,6 s** |
-| Reposicionamento do braço em ±90° | haste nunca passou de **1,34°** da vertical durante a manobra |
-| Regime permanente | erro médio do braço **< 1,1°**; desvio padrão de α ≈ **0,16°** (cerca de 2 contagens do AS5600) |
+| **1. Captura após o swing-up** | LQR habilitado com α = −13,65°; haste a menos de 1° da vertical em **2,6 s**; braço chega a 111° e se acomoda (±5°) em 11,8 s |
+| **2. Reposicionamento do braço em ±90°** | haste nunca passou de **1,34°** da vertical durante as manobras; acomodação do braço em 16,2 s (+90°) e 9,1 s (−90°) |
+| **3. Rejeição a perturbações** | pulsos de aceleração de −150 rad/s² por 100 ms no braço, com o LQR ativo: a haste chega a ≈ 8° e volta a \|α\| ≤ 1° em **≈ 1 s**; o braço volta a ±5° da referência em menos de 2 s |
+| **Regime permanente** | erro médio do braço **< 1,1°**; desvio padrão de α ≈ **0,16°** (cerca de 2 contagens do AS5600) |
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/images/swingup_captura_ref0.png" alt="Ensaio 1: swing-up e captura" width="400"><br><em>Ensaio 1: swing-up e captura</em></td>
+    <td align="center"><img src="docs/images/perturbacao_pulso.png" alt="Ensaio 3: pulsos de aceleração" width="400"><br><em>Ensaio 3: pulsos de aceleração no braço</em></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/degrau_braco_0_a_90.png" alt="Ensaio 2: braço de 0 a 90 graus" width="400"><br><em>Ensaio 2: braço de 0° para 90°</em></td>
+    <td align="center"><img src="docs/images/degrau_braco_0_a_menos90.png" alt="Ensaio 2: braço de 0 a -90 graus" width="400"><br><em>Ensaio 2: braço de 0° para −90°</em></td>
+  </tr>
+</table>
+
+---
+
+## Sobre este repositório
+
+Este repositório reúne a versão final do código, do firmware e da documentação usados no TCC. As coletas experimentais não estão incluídas: a interface grava as novas coletas na pasta `pid_serial_tuner/lqr_tuner/data/`, que fica fora do controle de versão.
+
+O desenvolvimento continua no repositório [Rotational-Inverted-Pendulum-Furuta](https://github.com/joseandersons/Rotational-Inverted-Pendulum-Furuta).
 
 ---
 
@@ -176,6 +207,7 @@ pendulo-furuta-tcc/
 │   │   ├── fuzzy.cpp             # Supervisor fuzzy de micropassos
 │   │   ├── calibration.cpp       # Calibração do zero do pêndulo (salva na flash)
 │   │   ├── autozero.cpp          # Ajuste automático do zero durante o equilíbrio
+│   │   ├── disturbance.cpp       # Perturbações experimentais: pulso e toque
 │   │   ├── serial_cmd.cpp        # Comandos recebidos pela serial
 │   │   ├── serial_tx.cpp         # Envio de telemetria
 │   │   └── params.cpp, filas.cpp # Parâmetros e filas compartilhadas
@@ -191,7 +223,7 @@ pendulo-furuta-tcc/
     │   ├── telemetry.py          # Decodificação da telemetria
     │   ├── config_store.py       # Lê/salva config.json
     │   ├── config.json           # Últimos ganhos e parâmetros usados
-    │   └── data/                 # Coletas (.csv) e modelos identificados
+    │   └── data/                 # Coletas gravadas pela interface (não versionadas)
     ├── simulacao.py              # Simulação do pêndulo com LQR e observador
     ├── plot_coleta.py            # Script auxiliar para gerar gráficos de coletas
     └── requirements.txt
@@ -292,6 +324,13 @@ A interface **LQR Tuner** permite:
 - ver gráficos em tempo real e **gravar coletas** em `lqr_tuner/data/coleta_lqr_<data>.csv`;
 - enviar comandos manuais pelo terminal serial.
 
+A interface também permite:
+
+- aplicar **perturbações**: pulso de aceleração somado à ação do LQR (amplitude e duração) e **toque** em malha aberta, que inclina a haste com o LQR suspenso e depois devolve o controle;
+- ajustar a **velocidade da rampa** da referência θ (0 = degrau);
+- configurar a **rampa de micropassos** do modo automático;
+- salvar, junto de cada coleta, um `.json` com a configuração usada e os eventos de perturbação.
+
 ### Outros scripts
 
 | Script | Como rodar | O que faz |
@@ -334,6 +373,16 @@ Os comandos podem ser enviados pelo terminal da interface ou por qualquer monito
 | `AZ 0` / `AZ 1` / `AZ?` / `AZRESET` | desliga / liga / consulta / apaga o autozero |
 | `OLR`, `OF`, `OG`, `OH`, `OAPPLY` | carregam e aplicam as matrizes do observador |
 | `MSAUTO 0/1` / `MSMAN <n>` / `MS?` | micropassos automáticos, manuais (8 a 256) ou consulta |
+
+Comandos de rampa, micropassos e perturbações:
+
+| Comando | Descrição |
+|---|---|
+| `THV <rad/s>` / `THV?` | velocidade da rampa da referência θ (0 = degrau) |
+| `MSRD …` / `MSRU …` / `MSR?` | rampa de descida / subida dos micropassos (níveis habilitados e tempos) ou consulta |
+| `DIST PULSE <a> <ms>` | soma um pulso de aceleração `a` (rad/s²) à ação do LQR durante `ms` milissegundos |
+| `DIST KICK <α0> <a>` | toque em malha aberta: com o LQR suspenso, o braço dá um tranco de aceleração `a` que inclina a haste em ≈ α0 graus |
+| `DIST CANCEL` | cancela a perturbação em andamento |
 
 ---
 

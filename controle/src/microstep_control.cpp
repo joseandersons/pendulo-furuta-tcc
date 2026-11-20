@@ -25,17 +25,45 @@ enum class MicrostepState {
 static MicrostepState g_microstep_state = MicrostepState::NORMAL;
 
 static uint32_t g_lqr_disturbance_start_ms = 0;
-static uint32_t g_last_ramp_step_ms = 0;
 static uint32_t g_recovery_block_until_ms = 0;
 static uint32_t g_stable_since_ms = 0;
 
-static uint8_t g_ramp_index = 0;
+/*
+  g_ramp_level: nivel aplicado pela maquina de estados (descendo ou subindo).
+  g_disturbance_microsteps: alvo da descida (nivel pedido pelo fuzzy, ja
+  ajustado aos niveis habilitados na rampa de descida).
+*/
+static uint16_t g_ramp_level = LQR_FINE_MICROSTEPS;
+static uint32_t g_ramp_level_since_ms = 0;
 static uint16_t g_disturbance_microsteps = LQR_DISTURBANCE_MICROSTEPS;
 static uint16_t g_lqr_current_microsteps = 0;
 static uint32_t g_lqr_status_last_ms = 0;
 
-static constexpr uint16_t RAMP_UP_STEPS[] = {16, 32, 64, 128, 256};
-static constexpr uint8_t RAMP_UP_STEPS_COUNT = 5;
+// Indice 0 = 256 (fino). Os demais sao os niveis configuraveis da rampa.
+static constexpr uint16_t RAMP_LEVELS[] = {256, 128, 64, 32, 16};
+static constexpr uint8_t RAMP_LEVELS_COUNT = 5;
+
+static_assert(
+  MICROSTEP_RAMP_LEVELS_COUNT == RAMP_LEVELS_COUNT - 1,
+  "niveis configuraveis = RAMP_LEVELS sem o 256"
+);
+
+static MicrostepRampConfig g_ramp_cfg = {
+  {true, true, true, true},
+  {
+    LQR_MICROSTEP_RAMP_DOWN_DEFAULT_MS,
+    LQR_MICROSTEP_RAMP_DOWN_DEFAULT_MS,
+    LQR_MICROSTEP_RAMP_DOWN_DEFAULT_MS,
+    LQR_MICROSTEP_RAMP_DOWN_DEFAULT_MS
+  },
+  {true, true, true, true},
+  {
+    LQR_MICROSTEP_RAMP_UP_DEFAULT_MS,
+    LQR_MICROSTEP_RAMP_UP_DEFAULT_MS,
+    LQR_MICROSTEP_RAMP_UP_DEFAULT_MS,
+    LQR_MICROSTEP_RAMP_UP_DEFAULT_MS
+  }
+};
 
 bool microstep_control_is_valid_microsteps(uint16_t microsteps) {
   return microsteps == 8   ||
@@ -84,22 +112,212 @@ uint16_t microstep_control_get_current_microsteps() {
   return g_lqr_current_microsteps;
 }
 
-static uint8_t ramp_index_for_microsteps(uint16_t microsteps) {
-  for (uint8_t i = 0; i < RAMP_UP_STEPS_COUNT; i++) {
-    if (RAMP_UP_STEPS[i] >= microsteps) {
-      return i;
+MicrostepRampConfig microstep_control_get_ramp() {
+  MicrostepRampConfig cfg;
+
+  portENTER_CRITICAL(&g_microstep_mux);
+  cfg = g_ramp_cfg;
+  portEXIT_CRITICAL(&g_microstep_mux);
+
+  return cfg;
+}
+
+bool microstep_control_set_ramp(
+  bool down,
+  const bool enabled[MICROSTEP_RAMP_LEVELS_COUNT],
+  const uint32_t ms[MICROSTEP_RAMP_LEVELS_COUNT]
+) {
+  if (enabled == nullptr || ms == nullptr) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < MICROSTEP_RAMP_LEVELS_COUNT; i++) {
+    if (ms[i] > LQR_MICROSTEP_RAMP_MAX_MS) {
+      return false;
     }
   }
 
-  return RAMP_UP_STEPS_COUNT - 1;
+  portENTER_CRITICAL(&g_microstep_mux);
+
+  for (uint8_t i = 0; i < MICROSTEP_RAMP_LEVELS_COUNT; i++) {
+    if (down) {
+      g_ramp_cfg.down_enabled[i] = enabled[i];
+      g_ramp_cfg.down_ms[i] = ms[i];
+    } else {
+      g_ramp_cfg.up_enabled[i] = enabled[i];
+      g_ramp_cfg.up_ms[i] = ms[i];
+    }
+  }
+
+  portEXIT_CRITICAL(&g_microstep_mux);
+
+  return true;
+}
+
+void microstep_control_print_ramp(bool down) {
+  MicrostepRampConfig cfg = microstep_control_get_ramp();
+
+  const bool* en = down ? cfg.down_enabled : cfg.up_enabled;
+  const uint32_t* ms = down ? cfg.down_ms : cfg.up_ms;
+
+  // Mesmo formato do comando: en128 en64 en32 en16 t128 t64 t32 t16
+  Serial.printf(
+    "%s %d %d %d %d %lu %lu %lu %lu\n",
+    down ? "MSRD" : "MSRU",
+    en[0] ? 1 : 0, en[1] ? 1 : 0, en[2] ? 1 : 0, en[3] ? 1 : 0,
+    (unsigned long)ms[0], (unsigned long)ms[1],
+    (unsigned long)ms[2], (unsigned long)ms[3]
+  );
+}
+
+static int8_t ramp_level_index(uint16_t microsteps) {
+  for (uint8_t i = 0; i < RAMP_LEVELS_COUNT; i++) {
+    if (RAMP_LEVELS[i] == microsteps) {
+      return (int8_t)i;
+    }
+  }
+
+  return -1;
+}
+
+/*
+  Tempo que a rampa fica no nivel antes de seguir. Nivel desmarcado (ou 256)
+  nao participa: tempo zero, a rampa passa direto por ele.
+*/
+static uint32_t ramp_dwell_ms(
+  const bool* enabled,
+  const uint32_t* ms,
+  uint16_t level
+) {
+  const int8_t i = ramp_level_index(level);
+
+  if (i <= 0) {
+    return 0;
+  }
+
+  return enabled[i - 1] ? ms[i - 1] : 0;
+}
+
+/*
+  Alvo da descida: o maior nivel marcado na descida que nao passe do pedido do
+  fuzzy. Se nenhum marcado chega ate o pedido, usa o menor nivel marcado.
+*/
+static uint16_t ramp_down_target_for(
+  const MicrostepRampConfig& cfg,
+  uint16_t fuzzy_microsteps
+) {
+  for (uint8_t i = 1; i < RAMP_LEVELS_COUNT; i++) {
+    if (cfg.down_enabled[i - 1] && RAMP_LEVELS[i] <= fuzzy_microsteps) {
+      return RAMP_LEVELS[i];
+    }
+  }
+
+  for (int8_t i = RAMP_LEVELS_COUNT - 1; i >= 1; i--) {
+    if (cfg.down_enabled[i - 1]) {
+      return RAMP_LEVELS[i];
+    }
+  }
+
+  return LQR_DISTURBANCE_MICROSTEPS;
+}
+
+static uint16_t ramp_next_down_level(
+  const MicrostepRampConfig& cfg,
+  uint16_t current,
+  uint16_t target
+) {
+  const int8_t i = ramp_level_index(current);
+
+  if (i < 0) {
+    return target;
+  }
+
+  for (uint8_t j = (uint8_t)i + 1; j < RAMP_LEVELS_COUNT; j++) {
+    const uint16_t level = RAMP_LEVELS[j];
+
+    if (level <= target) {
+      return target;
+    }
+
+    if (cfg.down_enabled[j - 1]) {
+      return level;
+    }
+  }
+
+  return target;
+}
+
+static uint16_t ramp_next_up_level(
+  const MicrostepRampConfig& cfg,
+  uint16_t current
+) {
+  const int8_t i = ramp_level_index(current);
+
+  for (int8_t j = i - 1; j >= 1; j--) {
+    if (cfg.up_enabled[j - 1]) {
+      return RAMP_LEVELS[j];
+    }
+  }
+
+  return LQR_FINE_MICROSTEPS;
+}
+
+/*
+  Avanca a descida: enquanto o tempo no nivel atual ja venceu, passa para o
+  proximo nivel marcado, sem passar do alvo.
+*/
+static void ramp_advance_down(const MicrostepRampConfig& cfg, uint32_t now) {
+  while (g_ramp_level > g_disturbance_microsteps) {
+    const uint32_t dwell = ramp_dwell_ms(
+      cfg.down_enabled,
+      cfg.down_ms,
+      g_ramp_level
+    );
+
+    if (g_ramp_level != LQR_FINE_MICROSTEPS &&
+        (now - g_ramp_level_since_ms) < dwell) {
+      break;
+    }
+
+    g_ramp_level = ramp_next_down_level(
+      cfg,
+      g_ramp_level,
+      g_disturbance_microsteps
+    );
+    g_ramp_level_since_ms = now;
+  }
+}
+
+/* Avanca a subida pelo mesmo criterio; para ao chegar em 256. */
+static void ramp_advance_up(const MicrostepRampConfig& cfg, uint32_t now) {
+  while (g_ramp_level < LQR_FINE_MICROSTEPS) {
+    const uint32_t dwell = ramp_dwell_ms(
+      cfg.up_enabled,
+      cfg.up_ms,
+      g_ramp_level
+    );
+
+    if ((now - g_ramp_level_since_ms) < dwell) {
+      break;
+    }
+
+    g_ramp_level = ramp_next_up_level(cfg, g_ramp_level);
+    g_ramp_level_since_ms = now;
+  }
 }
 
 static bool use_disturbance_profile_for(uint16_t microsteps) {
   /*
-    O perfil de ganhos de disturbio e mais agressivo. Por isso, ele so e usado
-    quando o supervisor fuzzy pede uma reducao forte de micropassos.
+    Perfil de ganhos alternativo (LQR_GAINS_DISTURBANCE_16), so usado com
+    LQR_USE_DISTURBANCE_GAINS = 1 e nivel <= 64. Desligado por padrao: assim
+    o automatico em 16 e o mesmo controlador do manual em 16.
   */
+#if LQR_USE_DISTURBANCE_GAINS
   return microsteps <= 64;
+#else
+  (void)microsteps;
+  return false;
+#endif
 }
 
 static bool is_rearm_stable(float alpha_rad, float alpha_dot_rad_s) {
@@ -263,6 +481,16 @@ static bool microstep_control_apply_profile(
   return true;
 }
 
+static void microstep_control_reset_ramp_state() {
+  g_microstep_state = MicrostepState::NORMAL;
+  g_lqr_disturbance_start_ms = 0;
+  g_recovery_block_until_ms = 0;
+  g_stable_since_ms = 0;
+  g_ramp_level = LQR_FINE_MICROSTEPS;
+  g_ramp_level_since_ms = 0;
+  g_disturbance_microsteps = LQR_DISTURBANCE_MICROSTEPS;
+}
+
 static bool microstep_control_apply_manual(
   float alpha_rad,
   float alpha_dot_rad_s,
@@ -273,13 +501,7 @@ static bool microstep_control_apply_manual(
 
   microstep_control_get_settings(&auto_enabled, &manual_microsteps);
 
-  g_microstep_state = MicrostepState::NORMAL;
-  g_lqr_disturbance_start_ms = 0;
-  g_last_ramp_step_ms = 0;
-  g_recovery_block_until_ms = 0;
-  g_stable_since_ms = 0;
-  g_ramp_index = 0;
-  g_disturbance_microsteps = LQR_DISTURBANCE_MICROSTEPS;
+  microstep_control_reset_ramp_state();
 
   return microstep_control_apply_profile(
     manual_microsteps,
@@ -290,41 +512,64 @@ static bool microstep_control_apply_manual(
   );
 }
 
-static void microstep_control_enter_disturbance_hold(
-  uint16_t microsteps,
+static void microstep_control_apply_ramp_level(
   float alpha_rad,
   float alpha_dot_rad_s,
   const char* reason
 ) {
-  g_microstep_state = MicrostepState::HOLD_DISTURBANCE;
-  g_lqr_disturbance_start_ms = millis();
-  g_last_ramp_step_ms = 0;
-  g_recovery_block_until_ms = 0;
-  g_stable_since_ms = 0;
-  g_ramp_index = 0;
-  g_disturbance_microsteps = microsteps;
-
   microstep_control_apply_profile(
-    g_disturbance_microsteps,
-    use_disturbance_profile_for(g_disturbance_microsteps),
+    g_ramp_level,
+    use_disturbance_profile_for(g_ramp_level),
     alpha_rad,
     alpha_dot_rad_s,
     reason
   );
 }
 
+/*
+  Entra em disturbio a partir do nivel atual (256 no NORMAL, ou o nivel em que
+  a subida estava) e desce pela rampa de descida ate o alvo.
+*/
+static void microstep_control_enter_disturbance_hold(
+  const MicrostepRampConfig& cfg,
+  uint16_t fuzzy_microsteps,
+  float alpha_rad,
+  float alpha_dot_rad_s,
+  const char* reason
+) {
+  const uint32_t now = millis();
+
+  uint16_t target = ramp_down_target_for(cfg, fuzzy_microsteps);
+
+  if (target > g_ramp_level) {
+    target = g_ramp_level;
+  }
+
+  g_microstep_state = MicrostepState::HOLD_DISTURBANCE;
+  g_lqr_disturbance_start_ms = now;
+  g_recovery_block_until_ms = 0;
+  g_stable_since_ms = 0;
+  g_disturbance_microsteps = target;
+  g_ramp_level_since_ms = now;
+
+  ramp_advance_down(cfg, now);
+  microstep_control_apply_ramp_level(alpha_rad, alpha_dot_rad_s, reason);
+}
+
 static void microstep_control_enter_ramp_up(
+  const MicrostepRampConfig& cfg,
   float alpha_rad,
   float alpha_dot_rad_s
 ) {
+  const uint32_t now = millis();
+
   g_microstep_state = MicrostepState::RAMP_UP;
-  g_ramp_index = ramp_index_for_microsteps(g_lqr_current_microsteps);
-  g_last_ramp_step_ms = millis();
+  g_ramp_level_since_ms = now;
   g_stable_since_ms = 0;
 
-  microstep_control_apply_profile(
-    RAMP_UP_STEPS[g_ramp_index],
-    false,
+  // Nivel atual desmarcado na subida tem tempo zero: ja sobe neste ciclo.
+  ramp_advance_up(cfg, now);
+  microstep_control_apply_ramp_level(
     alpha_rad,
     alpha_dot_rad_s,
     "iniciou rampa subindo"
@@ -338,7 +583,7 @@ static void microstep_control_enter_recovery_blocked(
   g_microstep_state = MicrostepState::RECOVERY_BLOCKED;
   g_recovery_block_until_ms = millis() + LQR_DISTURBANCE_REARM_BLOCK_MS;
   g_stable_since_ms = 0;
-  g_ramp_index = 0;
+  g_ramp_level = LQR_FINE_MICROSTEPS;
 
   microstep_control_apply_profile(
     LQR_FINE_MICROSTEPS,
@@ -350,13 +595,7 @@ static void microstep_control_enter_recovery_blocked(
 }
 
 void microstep_control_force_fine(float alpha_rad) {
-  g_microstep_state = MicrostepState::NORMAL;
-  g_lqr_disturbance_start_ms = 0;
-  g_last_ramp_step_ms = 0;
-  g_recovery_block_until_ms = 0;
-  g_stable_since_ms = 0;
-  g_ramp_index = 0;
-  g_disturbance_microsteps = LQR_DISTURBANCE_MICROSTEPS;
+  microstep_control_reset_ramp_state();
 
   microstep_control_apply_profile(
     LQR_FINE_MICROSTEPS,
@@ -368,13 +607,7 @@ void microstep_control_force_fine(float alpha_rad) {
 }
 
 void microstep_control_reset_runtime() {
-  g_microstep_state = MicrostepState::NORMAL;
-  g_lqr_disturbance_start_ms = 0;
-  g_last_ramp_step_ms = 0;
-  g_recovery_block_until_ms = 0;
-  g_stable_since_ms = 0;
-  g_ramp_index = 0;
-  g_disturbance_microsteps = LQR_DISTURBANCE_MICROSTEPS;
+  microstep_control_reset_ramp_state();
   g_lqr_current_microsteps = 0;
   g_lqr_status_last_ms = 0;
 }
@@ -407,6 +640,7 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
   }
 
   const uint32_t now = millis();
+  const MicrostepRampConfig cfg = microstep_control_get_ramp();
   FuzzySupervisorOutput fuzzy = fuzzy_evaluate_microsteps(
     alpha_rad,
     alpha_dot_rad_s
@@ -414,6 +648,8 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
 
   switch (g_microstep_state) {
     case MicrostepState::NORMAL: {
+      g_ramp_level = LQR_FINE_MICROSTEPS;
+
       microstep_control_apply_profile(
         LQR_FINE_MICROSTEPS,
         false,
@@ -424,6 +660,7 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
 
       if (fuzzy.microsteps < LQR_FINE_MICROSTEPS) {
         microstep_control_enter_disturbance_hold(
+          cfg,
           fuzzy.microsteps,
           alpha_rad,
           alpha_dot_rad_s,
@@ -435,14 +672,17 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
     }
 
     case MicrostepState::HOLD_DISTURBANCE: {
-      if (fuzzy.microsteps < g_disturbance_microsteps) {
-        g_disturbance_microsteps = fuzzy.microsteps;
-        g_lqr_disturbance_start_ms = now;
+      if (fuzzy.microsteps < LQR_FINE_MICROSTEPS) {
+        const uint16_t target = ramp_down_target_for(cfg, fuzzy.microsteps);
+
+        if (target < g_disturbance_microsteps) {
+          g_disturbance_microsteps = target;
+          g_lqr_disturbance_start_ms = now;
+        }
       }
 
-      microstep_control_apply_profile(
-        g_disturbance_microsteps,
-        use_disturbance_profile_for(g_disturbance_microsteps),
+      ramp_advance_down(cfg, now);
+      microstep_control_apply_ramp_level(
         alpha_rad,
         alpha_dot_rad_s,
         "segurando disturbio fuzzy"
@@ -452,10 +692,20 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
 
       if (elapsed >= LQR_DISTURBANCE_HOLD_MS) {
         if (fuzzy.microsteps < LQR_FINE_MICROSTEPS) {
-          g_disturbance_microsteps = fuzzy.microsteps;
+          /*
+            Disturbio continua: renova a retencao com o pedido atual do fuzzy,
+            mas nunca sobe por aqui (subir so pela rampa de subida).
+          */
+          uint16_t target = ramp_down_target_for(cfg, fuzzy.microsteps);
+
+          if (target > g_ramp_level) {
+            target = g_ramp_level;
+          }
+
+          g_disturbance_microsteps = target;
           g_lqr_disturbance_start_ms = now;
         } else {
-          microstep_control_enter_ramp_up(alpha_rad, alpha_dot_rad_s);
+          microstep_control_enter_ramp_up(cfg, alpha_rad, alpha_dot_rad_s);
         }
       }
 
@@ -470,6 +720,7 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
       */
       if (fuzzy.microsteps <= 32) {
         microstep_control_enter_disturbance_hold(
+          cfg,
           fuzzy.microsteps,
           alpha_rad,
           alpha_dot_rad_s,
@@ -478,24 +729,16 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
         break;
       }
 
-      if ((now - g_last_ramp_step_ms) >= LQR_MICROSTEP_RAMP_INTERVAL_MS) {
-        g_last_ramp_step_ms = now;
+      ramp_advance_up(cfg, now);
 
-        if (g_ramp_index < (RAMP_UP_STEPS_COUNT - 1)) {
-          g_ramp_index++;
-        }
-
-        microstep_control_apply_profile(
-          RAMP_UP_STEPS[g_ramp_index],
-          false,
+      if (g_ramp_level >= LQR_FINE_MICROSTEPS) {
+        microstep_control_enter_recovery_blocked(alpha_rad, alpha_dot_rad_s);
+      } else {
+        microstep_control_apply_ramp_level(
           alpha_rad,
           alpha_dot_rad_s,
           "rampa subindo"
         );
-
-        if (g_ramp_index >= (RAMP_UP_STEPS_COUNT - 1)) {
-          microstep_control_enter_recovery_blocked(alpha_rad, alpha_dot_rad_s);
-        }
       }
 
       break;
@@ -512,7 +755,10 @@ void microstep_control_update_lqr(float alpha_rad, float alpha_dot_rad_s) {
 
       /* Emergencia real: permite voltar para robusto mesmo durante bloqueio. */
       if (fuzzy.microsteps <= LQR_DISTURBANCE_MICROSTEPS) {
+        g_ramp_level = LQR_FINE_MICROSTEPS;
+
         microstep_control_enter_disturbance_hold(
+          cfg,
           fuzzy.microsteps,
           alpha_rad,
           alpha_dot_rad_s,

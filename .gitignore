@@ -1,2 +1,7 @@
 .pio
 .venv
+__pycache__/
+*.pyc
+# coletas geradas pela interface não vão para o repositório
+pid_serial_tuner/lqr_tuner/data/*
+!pid_serial_tuner/lqr_tuner/data/.gitkeep

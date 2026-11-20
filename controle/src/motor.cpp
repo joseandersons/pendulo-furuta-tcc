@@ -3,6 +3,8 @@
 
 #include "motor.h"
 #include "config.h"
+#include "disturbance.h"
+#include <esp_timer.h>
 
 static volatile uint16_t g_motor_microsteps_runtime = MOTOR_MICROSTEPS;
 static portMUX_TYPE g_motor_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -16,6 +18,9 @@ static volatile MotionMode g_motion_mode = MOTION_MODE_VELOCITY;
 
 static volatile float g_omega_alvo_rad_s = 0.0f;
 static volatile float g_accel_alvo_rad_s2 = 0.0f;
+static uint32_t g_pulse_id = 0;
+static float g_pulse_nominal = 0;
+static bool g_pulse_no_jerk = false;
 
 static float g_omega_aplicada_rad_s = 0.0f;
 static float g_accel_aplicada_rad_s2 = 0.0f;
@@ -260,6 +265,7 @@ void motor_set_velocity_rad_s(float omega) {
 
   g_motion_mode = MOTION_MODE_VELOCITY;
   g_omega_alvo_rad_s = omega;
+  g_pulse_id = 0;
   g_accel_alvo_rad_s2 = 0.0f;
 
   portEXIT_CRITICAL(&g_motor_mux);
@@ -296,6 +302,7 @@ void motor_set_acceleration_rad_s2(float accel_rad_s2) {
 
   g_motion_mode = MOTION_MODE_ACCELERATION;
   g_accel_alvo_rad_s2 = accel_rad_s2;
+  g_pulse_id = 0;
 
   portEXIT_CRITICAL(&g_motor_mux);
 }
@@ -307,6 +314,25 @@ void motor_set_acceleration_adaptive_rad_s2(
 ) {
   motor_set_balance_state(alpha_rad, alpha_dot_rad_s);
   motor_set_acceleration_rad_s2(accel_rad_s2);
+}
+
+void motor_set_pulse_acceleration_rad_s2(float total, float nominal, uint32_t pulse_id,
+                                       float alpha, float alpha_dot, bool no_jerk) {
+  motor_set_balance_state(alpha, alpha_dot);
+  // Publish total + fallback atomically. Same saturation as the ordinary setter.
+  portENTER_CRITICAL(&g_motor_mux);
+  if (g_motion_mode != MOTION_MODE_ACCELERATION) {
+    g_accel_aplicada_rad_s2 = 0.0f;
+    g_omega_interna_rad_s = g_omega_aplicada_rad_s;
+  }
+  g_motion_mode = MOTION_MODE_ACCELERATION;
+  // O pulso pode passar do limite do LQR (ate DIST_AMPLITUDE_MAX_RAD_S2).
+  const float pulse_limit = fmaxf(g_arm_accel_max_rad_s2, DIST_AMPLITUDE_MAX_RAD_S2);
+  g_accel_alvo_rad_s2 = constrain(total, -pulse_limit, pulse_limit);
+  g_pulse_nominal = constrain(nominal, -g_arm_accel_max_rad_s2, g_arm_accel_max_rad_s2);
+  g_pulse_id = pulse_id;
+  g_pulse_no_jerk = no_jerk;
+  portEXIT_CRITICAL(&g_motor_mux);
 }
 
 float motor_get_theta_est_rad() {
@@ -448,7 +474,9 @@ static float aplicar_curva_s_aceleracao(
   float accel_cmd,
   float dt,
   float accel_atual,
-  float* accel_saida
+  float* accel_saida,
+  bool pulso_ativo,
+  bool sem_jerk
 ) {
   if (dt <= 0.0f) {
     *accel_saida = accel_atual;
@@ -460,6 +488,10 @@ static float aplicar_curva_s_aceleracao(
   portENTER_CRITICAL(&g_motor_mux);
   accel_limit = g_arm_accel_max_rad_s2;
   portEXIT_CRITICAL(&g_motor_mux);
+
+  if (pulso_ativo) {
+    accel_limit = fmaxf(accel_limit, DIST_AMPLITUDE_MAX_RAD_S2);
+  }
 
   float vel_limit = motor_get_effective_velocity_max_rad_s();
 
@@ -486,11 +518,9 @@ static float aplicar_curva_s_aceleracao(
     accel_cmd = 0.0f;
   }
 
-  float accel_suave = aplicar_limite_jerk(
-    accel_atual,
-    accel_cmd,
-    dt
-  );
+  float accel_suave = sem_jerk
+    ? accel_cmd
+    : aplicar_limite_jerk(accel_atual, accel_cmd, dt);
 
   float omega = atual + accel_suave * dt;
   omega = constrain(omega, -vel_limit, vel_limit);
@@ -512,6 +542,7 @@ void motor_stop_immediate() {
   portENTER_CRITICAL(&g_motor_mux);
 
   g_motion_mode = MOTION_MODE_VELOCITY;
+  g_pulse_id = 0;
   g_omega_alvo_rad_s = 0.0f;
   g_accel_alvo_rad_s2 = 0.0f;
   g_omega_aplicada_rad_s = 0.0f;
@@ -541,6 +572,8 @@ static void motor_task(void*) {
       float atual;
       float accel_cmd;
       float accel_atual;
+      uint32_t pulse_id;
+      float pulse_nominal;
       MotionMode motion_mode;
 
       portENTER_CRITICAL(&g_motor_mux);
@@ -552,6 +585,9 @@ static void motor_task(void*) {
                 ? g_omega_interna_rad_s
                 : g_omega_aplicada_rad_s;
       accel_cmd = g_accel_alvo_rad_s2;
+      pulse_id = g_pulse_id;
+      pulse_nominal = g_pulse_nominal;
+      const bool pulse_no_jerk = g_pulse_no_jerk;
       accel_atual = g_accel_aplicada_rad_s2;
       motion_mode = g_motion_mode;
 
@@ -560,13 +596,21 @@ static void motor_task(void*) {
       float omega_cmd = 0.0f;
       float accel_nova = 0.0f;
 
+      bool pulso_ativo = false;
+      if (pulse_id) {
+        pulso_ativo = disturbance_motor_active(pulse_id, esp_timer_get_time());
+        if (!pulso_ativo) accel_cmd = pulse_nominal;
+      }
+
       if (motion_mode == MOTION_MODE_ACCELERATION) {
         omega_cmd = aplicar_curva_s_aceleracao(
           atual,
           accel_cmd,
           dt,
           accel_atual,
-          &accel_nova
+          &accel_nova,
+          pulso_ativo,
+          pulso_ativo && pulse_no_jerk
         );
       } else {
         omega_cmd = aplicar_curva_s_velocidade(

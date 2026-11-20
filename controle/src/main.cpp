@@ -11,8 +11,11 @@
 #include "calibration.h"
 
 void setup(){
+  // O buffer de TX precisa ser definido ANTES do begin(); depois ele e
+  // ignorado e toda escrita bloqueia no FIFO de 128 B da UART, travando
+  // quem imprime (inclusive o laco de controle, via [lqr-ms] status).
+  Serial.setTxBufferSize(4096);
   Serial.begin(115200);
-  Serial.setTxBufferSize(2048);   
 
   filas_init();
 
