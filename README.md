@@ -29,6 +29,7 @@ Construção, modelagem e controle experimental de um **pêndulo invertido rotac
 - [Como o pêndulo funciona](#como-o-pêndulo-funciona)
 - [Resultados](#resultados)
 - [Sobre este repositório](#sobre-este-repositório)
+- [Artigo](#artigo)
 - [Lista de materiais](#lista-de-materiais)
 - [Modelos 3D](#modelos-3d)
 - [Ligações elétricas](#ligações-elétricas)
@@ -128,6 +129,14 @@ Foram realizados três ensaios na bancada, todos com o LQR discreto e o observad
 Este repositório reúne a versão final do código, do firmware e da documentação usados no TCC. O texto completo do TCC e os slides da defesa estão na pasta `docs/`. As coletas experimentais não estão incluídas: a interface grava as novas coletas na pasta `pid_serial_tuner/lqr_tuner/data/`, que fica fora do controle de versão.
 
 O desenvolvimento continua no repositório [Rotational-Inverted-Pendulum-Furuta](https://github.com/joseandersons/Rotational-Inverted-Pendulum-Furuta).
+
+---
+
+## Artigo
+
+A construção da bancada e uma primeira estratégia de controle deste trabalho, com PID e supervisão fuzzy Takagi-Sugeno, deram origem a um artigo no Congresso Brasileiro de Automática (CBA 2026):
+
+> J. A. da Silva, T. F. M. Laurentino, R. K. L. Pereira, P. H. V. Giló, H. L. Gomes, C. O. F. dos Anjos e Í. B. Q. de Araújo. **Construção e Controle PID com Supervisão Fuzzy de uma Bancada Didática de Baixo Custo para Pêndulo Invertido Rotacional**. Congresso Brasileiro de Automática (CBA), 2026.
 
 ---
 
