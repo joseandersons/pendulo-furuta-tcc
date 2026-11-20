@@ -4,6 +4,8 @@ Construção, modelagem e controle experimental de um **pêndulo invertido rotac
 
 > Trabalho de Conclusão de Curso — Engenharia de Computação, Instituto de Computação (UFAL), 2026.
 > Autor: **José Anderson da Silva** · Orientador: Prof. Dr. Ícaro Bezerra Queiroz de Araújo · Coorientador: Prof. Dr. Tiago Alves de Almeida
+>
+> **[Texto do TCC (PDF)](docs/TCC.pdf)** · **[Slides da defesa (PDF)](docs/apresentacao_tcc.pdf)**
 
 <p align="center">
   <img src="docs/images/plataforma_construida.png" alt="Plataforma construída" width="420">
@@ -123,7 +125,7 @@ Foram realizados três ensaios na bancada, todos com o LQR discreto e o observad
 
 ## Sobre este repositório
 
-Este repositório reúne a versão final do código, do firmware e da documentação usados no TCC. As coletas experimentais não estão incluídas: a interface grava as novas coletas na pasta `pid_serial_tuner/lqr_tuner/data/`, que fica fora do controle de versão.
+Este repositório reúne a versão final do código, do firmware e da documentação usados no TCC. O texto completo do TCC e os slides da defesa estão na pasta `docs/`. As coletas experimentais não estão incluídas: a interface grava as novas coletas na pasta `pid_serial_tuner/lqr_tuner/data/`, que fica fora do controle de versão.
 
 O desenvolvimento continua no repositório [Rotational-Inverted-Pendulum-Furuta](https://github.com/joseandersons/Rotational-Inverted-Pendulum-Furuta).
 
@@ -202,6 +204,8 @@ Para mudar pinos, corrente ou micropassos, edite [`controle/include/config.h`](c
 ```
 pendulo-furuta-tcc/
 ├── cad/                          # Peças da plataforma em STL
+│
+├── docs/                         # Texto do TCC e slides da defesa (PDF)
 │
 ├── controle/                     # Firmware do ESP32 (projeto PlatformIO)
 │   ├── platformio.ini            # Placa, framework e bibliotecas
