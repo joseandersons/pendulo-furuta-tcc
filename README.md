@@ -148,15 +148,13 @@ Preços de referência do Mercado Livre em novembro de 2026.
 | 7 | 1 | Fonte | 24 V CC | – | – |
 | 8 | 3 | Conector Mike (aviação) | interligações elétricas (vendido em kit com 10 pares) | [Mercado Livre](https://www.mercadolivre.com.br/10-pecas-conector-para-mike-5-vias-macho-femea-par/up/MLBU3430546453) | 64 (kit) |
 | 9 | 1 | Chave liga/desliga | corta o retorno da fonte do motor (vendida em kit com 10) | [Mercado Livre](https://www.mercadolivre.com.br/10-pecas-chave-gangorra-2-terminais-liga-desliga-comum/up/MLBU2121393000) | 13 (kit) |
-| 10 | 2 | Barra de alumínio | seção quadrada (braço e haste pendular) | | |
-| 11 | 11 | Parafuso M3 | cabeça abaulada | | |
-| 12 | 4 | Parafuso M5 | cabeça abaulada | | |
-| 13 | 4 | Porca M5 | travante (Parlock) | | |
-| 14 | – | Chapa de acrílico | estrutura (corte a laser) | | |
-| 15 | – | Filamento PLA | peças impressas em 3D | | |
-| | | | | **Total** | **441** |
+| 10 | 1 | Barra de alumínio | trilho maciço de 6 mm, 1,50 m, cortado para o braço e a haste pendular | [Mercado Livre](https://www.mercadolivre.com.br/trilho-macico-vergalhao-6mm-para-janela-aluminio-150-mts/up/MLBU5075053566) | 30 |
+| 11 | 11 | Parafuso M3 | cabeça abaulada, M3 x 10 mm (vendido em kit com 20) | [Mercado Livre](https://www.mercadolivre.com.br/parafuso-m3-com-cabeca-abaulada-m3-x-10mm-com-20-pecas/up/MLBU3081094731) | 22 (kit) |
+| 12 | 4 | Parafuso M5 | Allen, cabeça abaulada, M5 x 10 mm, inox (vendido em kit com 20) | [Mercado Livre](https://www.mercadolivre.com.br/parafuso-allen-cabeca-abaulada-m5-x-10-inox-304-20-pecas/p/MLB2125377980) | 18 (kit) |
+| 13 | 4 | Porca M5 | travante (Parlock) (vendida em kit com 100) | [Mercado Livre](https://www.mercadolivre.com.br/porca-sextavada-parlock-m5-nylon-auto-travante-100pcs/p/MLB2122842425) | 26 (kit) |
+| | | | | **Total** | **537** |
 
-O total não inclui a fonte de 24 V, que fica a cargo de quem for montar, nem os itens mecânicos sem preço.
+O total não inclui a fonte de 24 V, que fica a cargo de quem for montar.
 
 ---
 
