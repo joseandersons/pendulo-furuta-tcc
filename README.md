@@ -135,7 +135,7 @@ O desenvolvimento continua no repositório [Rotational-Inverted-Pendulum-Furuta]
 
 ## Lista de materiais
 
-Preços de referência do Mercado Livre em novembro de 2026.
+Preços pesquisados no Mercado Livre em 20/11/2026.
 
 | # | Qtd. | Componente | Especificação | Link | Preço (R$) |
 |---|---|---|---|---|---|
