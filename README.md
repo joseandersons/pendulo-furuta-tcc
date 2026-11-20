@@ -28,6 +28,7 @@ Construção, modelagem e controle experimental de um **pêndulo invertido rotac
 - [Resultados](#resultados)
 - [Sobre este repositório](#sobre-este-repositório)
 - [Lista de materiais](#lista-de-materiais)
+- [Modelos 3D](#modelos-3d)
 - [Ligações elétricas](#ligações-elétricas)
 - [Estrutura do repositório](#estrutura-do-repositório)
 - [Firmware (PlatformIO)](#firmware-platformio)
@@ -153,6 +154,25 @@ O total não inclui a fonte de 24 V, que fica a cargo de quem for montar.
 
 ---
 
+## Modelos 3D
+
+A pasta [`cad/`](cad/) tem um arquivo `.stl` para cada peça fabricada da plataforma. O GitHub mostra cada arquivo em 3D no navegador, então dá para girar a peça antes de baixar. As peças compradas (motor, polia, encoder, sensores, placas e parafusos) e as barras de alumínio não estão na pasta.
+
+As peças podem ser impressas em 3D ou cortadas em acrílico, conforme os recursos de quem for montar. As placas da base têm 4 mm de espessura e se encaixam umas nas outras, então são as mais indicadas para o corte a laser.
+
+| Arquivos | Parte da plataforma |
+|---|---|
+| `base_lateral_1` a `base_lateral_4`, `base_placa_1` e `base_placa_2` | caixa da base, que abriga a eletrônica |
+| `suporte_encoder_motor` | suporte do motor e do AS5600 do braço |
+| `suporte_braco_motor_1` e `suporte_braco_motor_2` | fixação do braço no eixo do motor |
+| `conexao_braco_haste` | ligação entre o braço e a articulação da haste |
+| `encoder_pendulo_1` a `encoder_pendulo_3` | montagem do encoder da haste |
+| `suporte_haste_encoder_1` e `suporte_haste_encoder_2` | fixação da haste no eixo do encoder |
+| `suporte_conector_mike` | suporte do conector Mike na parte de cima |
+| `passa_fio` | guia dos fios (são duas peças iguais) |
+
+---
+
 ## Ligações elétricas
 
 <p align="center">
@@ -181,6 +201,8 @@ Para mudar pinos, corrente ou micropassos, edite [`controle/include/config.h`](c
 
 ```
 pendulo-furuta-tcc/
+├── cad/                          # Peças da plataforma em STL
+│
 ├── controle/                     # Firmware do ESP32 (projeto PlatformIO)
 │   ├── platformio.ini            # Placa, framework e bibliotecas
 │   ├── include/
