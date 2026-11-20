@@ -135,29 +135,28 @@ O desenvolvimento continua no repositório [Rotational-Inverted-Pendulum-Furuta]
 
 ## Lista de materiais
 
-> **Preencha os links e preços.** Os valores abaixo são as especificações usadas no protótipo.
+Preços de referência do Mercado Livre em novembro de 2026.
 
 | # | Qtd. | Componente | Especificação | Link | Preço (R$) |
 |---|---|---|---|---|---|
-| 1 | 1 | Motor de passo | NEMA 17, 4,2 kgf·cm, 200 passos/volta | | |
-| 2 | 1 | Driver de motor de passo | TMC2209 (módulo) | | |
-| 3 | 1 | Polia dentada | para o eixo do motor (acoplamento do braço) | | |
-| 4 | 2 | Encoder magnético | AS5600 (módulo) | | |
-| 5 | 2 | Ímã de magnetização diametral | para o AS5600 | | |
-| 6 | 1 | Encoder incremental (só a mecânica) | carcaça, eixo e rolamentos reaproveitados na articulação da haste | | |
-| 7 | 1 | Microcontrolador | ESP32-WROOM (placa DevKit V1) | | |
-| 8 | 1 | Fonte | 24 V CC | | |
-| 9 | 3 | Conector Mike (aviação) | interligações elétricas | | |
-| 10 | 1 | Chave liga/desliga | corta o retorno da fonte do motor | | |
-| 11 | 1 | Resistor | 1 kΩ (UART do TMC2209) | | |
-| 12 | 1 | Placa perfurada, bornes e fios | montagem da eletrônica | | |
-| 13 | 2 | Barra de alumínio | seção quadrada (braço e haste pendular) | | |
-| 14 | 11 | Parafuso M3 | cabeça abaulada | | |
-| 15 | 4 | Parafuso M5 | cabeça abaulada | | |
-| 16 | 4 | Porca M5 | travante (Parlock) | | |
-| 17 | – | Chapa de acrílico | estrutura (corte a laser) | | |
-| 18 | – | Filamento PLA | peças impressas em 3D | | |
-| | | | | **Total** | |
+| 1 | 1 | Motor de passo | NEMA 17, 4,2 kgf·cm, 200 passos/volta | [Mercado Livre](https://www.mercadolivre.com.br/motor-de-passo-nema-17-42kgf-14a-ender-3-impressora-3d/p/MLB2082965667) | 60 |
+| 2 | 1 | Driver de motor de passo | TMC2209 (módulo) | [Mercado Livre](https://www.mercadolivre.com.br/driver-tmc2209-pmotor-de-passo-impressora-3d-router-cnc/up/MLBU733855192) | 60 |
+| 3 | 1 | Polia dentada | GT2, 20 dentes, para o eixo do motor (acoplamento do braço) | [Mercado Livre](https://www.mercadolivre.com.br/polia-20-dentes-correia-gt2-6mm-passo-2mm-nema-17/up/MLBU1439250744) | 22 |
+| 4 | 2 | Encoder magnético | AS5600 (módulo, já vem com o ímã) | [Mercado Livre](https://www.mercadolivre.com.br/sensor-de-ngulo-magnetico-as5600-potenciometro-arduino/up/MLBU3218129435) | 35 cada |
+| 5 | 1 | Encoder incremental (só a mecânica) | carcaça, eixo e rolamentos reaproveitados na articulação da haste | [Mercado Livre](https://www.mercadolivre.com.br/encoder-incremental-600-pulsos-5a-24v/p/MLB2082206149) | 117 |
+| 6 | 1 | Microcontrolador | ESP32-WROOM (placa DevKit V1) | [Mercado Livre](https://www.mercadolivre.com.br/placa-esp32-pino-soldado-wifi-bluetooth-com-esp32-wroom-32/up/MLBU755682304) | 35 |
+| 7 | 1 | Fonte | 24 V CC | – | – |
+| 8 | 3 | Conector Mike (aviação) | interligações elétricas (vendido em kit com 10 pares) | [Mercado Livre](https://www.mercadolivre.com.br/10-pecas-conector-para-mike-5-vias-macho-femea-par/up/MLBU3430546453) | 64 (kit) |
+| 9 | 1 | Chave liga/desliga | corta o retorno da fonte do motor (vendida em kit com 10) | [Mercado Livre](https://www.mercadolivre.com.br/10-pecas-chave-gangorra-2-terminais-liga-desliga-comum/up/MLBU2121393000) | 13 (kit) |
+| 10 | 2 | Barra de alumínio | seção quadrada (braço e haste pendular) | | |
+| 11 | 11 | Parafuso M3 | cabeça abaulada | | |
+| 12 | 4 | Parafuso M5 | cabeça abaulada | | |
+| 13 | 4 | Porca M5 | travante (Parlock) | | |
+| 14 | – | Chapa de acrílico | estrutura (corte a laser) | | |
+| 15 | – | Filamento PLA | peças impressas em 3D | | |
+| | | | | **Total** | **441** |
+
+O total não inclui a fonte de 24 V, que fica a cargo de quem for montar, nem os itens mecânicos sem preço.
 
 ---
 
