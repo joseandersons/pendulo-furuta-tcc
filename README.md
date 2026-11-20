@@ -11,11 +11,6 @@ Construção, modelagem e controle experimental de um **pêndulo invertido rotac
   <img src="docs/images/plataforma_cad.png" alt="Modelo 3D da plataforma" width="380">
 </p>
 
-<p align="center">
-  <img src="docs/images/demo_swingup_captura.gif" alt="Swing-up e captura do pêndulo pelo LQR" width="480"><br>
-  <em>Swing-up e captura da haste pelo LQR.</em>
-</p>
-
 ### Vídeo da demonstração
 
 <p align="center">
